@@ -29,7 +29,7 @@ func DownloadAssetRefs(client *http.Client, assets []state.AssetRef, targetDir s
 
 	for i, asset := range assets {
 		assetURL := strings.TrimSpace(asset.URL)
-		if assetURL == "" {
+		if assetURL == "" || state.IsSiteInfoURL(assetURL) {
 			continue
 		}
 

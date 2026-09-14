@@ -48,6 +48,23 @@ func NewSession(baseURL string, cookiePath string) (*Session, error) {
 }
 
 func NewSessionWithAuthConfig(baseURL string, authConfig AuthConfig) (*Session, error) {
+	session, err := LoadSessionWithAuthConfig(baseURL, authConfig)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := session.ValidateAuthentication(); err != nil {
+		if errors.Is(err, ErrSessionExpired) || errors.Is(err, ErrNotAuthenticated) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", ErrSessionExpired, err)
+	}
+
+	return session, nil
+}
+
+// LoadSessionWithAuthConfig restores saved cookies without making network requests.
+// Callers must handle authentication failures on their context-bound requests.
+func LoadSessionWithAuthConfig(baseURL string, authConfig AuthConfig) (*Session, error) {
 	normalizedBaseURL, err := NormalizeBaseURL(baseURL)
 	if err != nil {
 		return nil, err
@@ -81,13 +98,6 @@ func NewSessionWithAuthConfig(baseURL string, authConfig AuthConfig) (*Session, 
 		BaseURL: normalizedBaseURL,
 		Client:  client,
 	}
-	if _, err := session.ValidateAuthentication(); err != nil {
-		if errors.Is(err, ErrSessionExpired) || errors.Is(err, ErrNotAuthenticated) {
-			return nil, err
-		}
-		return nil, fmt.Errorf("%w: %v", ErrSessionExpired, err)
-	}
-
 	return session, nil
 }
 

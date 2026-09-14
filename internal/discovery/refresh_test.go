@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/PuerkitoBio/goquery"
 
 	"themis-cli/internal/state"
 )
@@ -61,6 +64,10 @@ func TestRefreshNode_DeepNodeDoesNotFetchRoot(t *testing.T) {
 	hits := map[string]int{}
 	client := testClientFromMap(t, pages, hits)
 	service := NewService(base)
+	progressURLs := []string{}
+	service.Progress = func(progress RefreshProgress) {
+		progressURLs = append(progressURLs, progress.URL)
+	}
 	st := state.NewEmptyState()
 
 	result, err := service.RefreshNode(client, &st, deep, 1)
@@ -69,6 +76,9 @@ func TestRefreshNode_DeepNodeDoesNotFetchRoot(t *testing.T) {
 	}
 	if result.FetchedNodes != 2 {
 		t.Fatalf("unexpected fetched nodes: %d", result.FetchedNodes)
+	}
+	if len(progressURLs) != 2 || progressURLs[0] != deep || progressURLs[1] != child {
+		t.Fatalf("unexpected progress URLs: %#v", progressURLs)
 	}
 	if hits[root] != 0 {
 		t.Fatalf("expected root not to be fetched, hits=%d", hits[root])
@@ -155,6 +165,8 @@ func TestRefreshNode_ExtractsMetadata(t *testing.T) {
 		<div><a href="/file/course/%40tests/1.out">1.out</a></div>
 		<div><a href="/download/os/lab3.zip">lab3.zip</a></div>
 		<p class="ass-description">Course summary</p>
+        <footer><a href="/about">About Themis</a>
+        <a href="https://www.rug.nl/info/privacy" target="_blank">Privacy Policy</a></footer>
 		</body></html>`,
 	}
 
@@ -380,4 +392,47 @@ func contains(list []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func TestExtractDetailsDatesWithTooltipLabels(t *testing.T) {
+	html := `<div class="ass-config">
+ <div class="cfg-line"><span class="cfg-key"><span class="tip">Deadline:</span><span role="tooltip" class="tip-text">You can still submit after this date, but may be penalized.</span></span>
+ <span class="cfg-val"><span class="tip" data-title="2026-09-17T07:00:00.000Z">Thu Sep 17 2026 09:00:00 GMT+0200</span><span class="tip-text">2026-09-17T07:00:00.000Z</span></span></div>
+ <div class="cfg-line"><span class="cfg-key">End:<span class="tip-text">You can no longer submit after this date.</span></span>
+ <span class="cfg-val"><span data-title="2026-09-18T07:00:00.000Z">Fri Sep 18 2026 09:00:00 GMT+0200</span></span></div>
+ <div class="cfg-line"><span class="cfg-key">Start:<span class="tip-text">You can start submitting after this date.</span></span>
+ <span class="cfg-val"><time datetime="2026-09-10T09:00:00Z">Thu Sep 10 2026 11:00:00 GMT+0200</time></span></div>
+ <div class="cfg-line"><span class="cfg-key">Leading Submission:<span class="tip-text">The submission used for grading.</span></span><span class="cfg-val">latest</span></div>
+ </div>`
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		t.Fatal(err)
+	}
+	details := extractDetails(doc, "https://themis.housing.rug.nl/course/example/lab2")
+	cfg := details["config"].(map[string]any)
+	for key, expected := range map[string]string{
+		"deadline_iso":       "2026-09-17T07:00:00.000Z",
+		"deadline_display":   "Thu Sep 17 2026 09:00:00 GMT+0200",
+		"end_iso":            "2026-09-18T07:00:00.000Z",
+		"start_iso":          "2026-09-10T09:00:00Z",
+		"leading_submission": "latest",
+	} {
+		if cfg[key] != expected {
+			t.Errorf("%s = %v, want %s", key, cfg[key], expected)
+		}
+	}
+	for key := range cfg {
+		if strings.Contains(key, ":") {
+			t.Errorf("tooltip in config key: %s", key)
+		}
+	}
+	st := state.NewEmptyState()
+	st.Nodes["lab2"] = state.Node{ID: "lab2", Kind: "assignment", Details: details}
+	summary := state.ComputeCourseSummary(st, "lab2", time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC))
+	if len(summary.UpcomingDeadlines) != 1 || summary.UpcomingDeadlines[0].DaysUntil != 3 {
+		t.Fatalf("extracted deadline did not reach summary: %+v", summary)
+	}
+	if got := summary.UpcomingDeadlines[0].Assignments[0].DueAt.UTC().Format(time.RFC3339); got != "2026-09-17T07:00:00Z" {
+		t.Fatalf("used cutoff instead of deadline: %s", got)
+	}
 }

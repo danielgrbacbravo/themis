@@ -8,6 +8,9 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"themis-cli/internal/tui/textutil"
+	"themis-cli/internal/tui/theme"
 )
 
 type Prefill struct {
@@ -33,12 +36,12 @@ type SubmitResult struct {
 type SubmitFunc func(req SubmitRequest) (SubmitResult, error)
 
 var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "33", Dark: "75"})
-	labelStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "243", Dark: "247"})
-	focusStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "39", Dark: "81"})
-	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"})
-	successStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "42"})
-	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "244", Dark: "246"})
+	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(theme.Accent)
+	labelStyle   = lipgloss.NewStyle()
+	focusStyle   = lipgloss.NewStyle().Bold(true).Foreground(theme.Info)
+	errorStyle   = lipgloss.NewStyle().Foreground(theme.Error)
+	successStyle = lipgloss.NewStyle().Foreground(theme.Success)
+	mutedStyle   = lipgloss.NewStyle().Foreground(theme.Muted)
 )
 
 func Run(prefill Prefill, submit SubmitFunc) (SubmitResult, error) {
@@ -67,6 +70,7 @@ type submitFinishedMsg struct {
 }
 
 type model struct {
+	width, height int
 	usernameInput textinput.Model
 	passwordInput textinput.Model
 	totpInput     textinput.Model
@@ -83,17 +87,20 @@ type model struct {
 
 func newModel(prefill Prefill, submit SubmitFunc) model {
 	username := textinput.New()
+	username.PlaceholderStyle = mutedStyle
 	username.Placeholder = "s1234567"
 	username.SetValue(strings.TrimSpace(prefill.Username))
 	username.Focus()
 
 	password := textinput.New()
+	password.PlaceholderStyle = mutedStyle
 	password.Placeholder = "password"
 	password.EchoMode = textinput.EchoPassword
 	password.EchoCharacter = '*'
 	password.SetValue(prefill.Password)
 
 	totp := textinput.New()
+	totp.PlaceholderStyle = mutedStyle
 	totp.Placeholder = "123456"
 	totp.CharLimit = 12
 
@@ -115,6 +122,26 @@ func newModel(prefill Prefill, submit SubmitFunc) model {
 func (m model) Init() tea.Cmd { return nil }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Resizing and cancellation remain available while authentication is pending.
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		inputWidth := msg.Width - 13 // label, prompt, and cursor
+		if inputWidth < 1 {
+			inputWidth = 1
+		}
+		m.usernameInput.Width, m.passwordInput.Width, m.totpInput.Width = inputWidth, inputWidth, inputWidth
+		// Recompute each input's horizontal viewport after its Width changes.
+		m.usernameInput, _ = m.usernameInput.Update(msg)
+		m.passwordInput, _ = m.passwordInput.Update(msg)
+		m.totpInput, _ = m.totpInput.Update(msg)
+		return m, nil
+	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" || msg.String() == "esc" {
+			m.canceled = true
+			return m, tea.Quit
+		}
+	}
 	if m.submitting {
 		switch msg := msg.(type) {
 		case submitFinishedMsg:
@@ -134,9 +161,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "esc":
-			m.canceled = true
-			return m, tea.Quit
 		case "tab", "shift+tab", "up", "down":
 			m.moveFocus(msg.String())
 			return m, nil
@@ -177,20 +201,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("Themis Login"))
-	b.WriteString("\n\n")
-	b.WriteString(m.renderField("Username", m.usernameInput.View(), 0))
-	b.WriteString("\n")
-	b.WriteString(m.renderField("Password", m.passwordInput.View(), 1))
-	b.WriteString("\n")
-	b.WriteString(m.renderField("TOTP", m.totpInput.View(), 2))
-	b.WriteString("\n")
-	b.WriteString(m.renderToggle("Save username", m.saveUsername, 3))
-	b.WriteString("\n")
-	b.WriteString(m.renderToggle("Save password", m.savePassword, 4))
-	b.WriteString("\n\n")
-
+	if m.width <= 0 || m.height <= 0 {
+		return ""
+	}
+	if m.width < 24 || m.height < 8 {
+		return textutil.Fit("Terminal too small\nResize to 24 x 8\nEsc cancels", m.width, m.height)
+	}
 	submitLabel := "[ Submit ]"
 	if m.submitting {
 		submitLabel = "[ Submitting... ]"
@@ -198,17 +214,30 @@ func (m model) View() string {
 	if m.focusIndex == 5 {
 		submitLabel = focusStyle.Render(submitLabel)
 	}
-	b.WriteString(submitLabel)
-	b.WriteString("\n\n")
-
-	if strings.TrimSpace(m.statusLine) != "" {
-		b.WriteString(m.statusLine)
-		b.WriteString("\n")
-	} else {
-		b.WriteString(mutedStyle.Render("Tab/Shift+Tab move focus, Space toggles options, Enter submits, Esc cancels"))
-		b.WriteString("\n")
+	fields := []string{
+		m.renderField("Username", m.usernameInput.View(), 0),
+		m.renderField("Password", m.passwordInput.View(), 1),
+		m.renderField("TOTP", m.totpInput.View(), 2),
+		m.renderToggle("Save username", m.saveUsername, 3),
+		m.renderToggle("Save password", m.savePassword, 4),
+		submitLabel,
 	}
-	return b.String()
+	rows := m.height - 3 // fixed title, status, and help
+	if rows > len(fields) {
+		rows = len(fields)
+	}
+	start := 0
+	if m.focusIndex >= rows {
+		start = m.focusIndex - rows + 1
+	}
+	status := m.statusLine
+	if m.submitting {
+		status = "Signing in..."
+	}
+	lines := []string{titleStyle.Render("Themis Login")}
+	lines = append(lines, fields[start:start+rows]...)
+	lines = append(lines, status, labelStyle.Render("Tab move · Space toggle · Enter next/submit · Esc cancel"))
+	return textutil.Fit(strings.Join(lines, "\n"), m.width, m.height)
 }
 
 func (m *model) moveFocus(key string) {
@@ -269,6 +298,10 @@ func (m model) startSubmit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.submit == nil {
+		m.statusLine = errorStyle.Render("Login unavailable.")
+		return m, nil
+	}
 	req := SubmitRequest{
 		Username:     username,
 		Password:     password,

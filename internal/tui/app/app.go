@@ -10,11 +10,14 @@ import (
 
 type Config struct {
 	State               state.State
+	DisableAutoRefresh  bool
+	ReducedMotion       bool
 	RootNodeID          string
 	LinkedRootNodeID    string
 	SubtreeRefreshDepth int
 	RefreshExecutor     RefreshExecutor
 	DownloadExecutor    DownloadExecutor
+	PreviewExecutor     PreviewExecutor
 	DefaultDownloadDir  string
 	RecentAssetChoices  map[string][]string
 	PersistChoices      PersistChoicesFunc

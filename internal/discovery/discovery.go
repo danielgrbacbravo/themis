@@ -11,7 +11,14 @@ import (
 )
 
 type Service struct {
-	BaseURL string
+	BaseURL  string
+	Progress func(RefreshProgress)
+}
+
+type RefreshProgress struct {
+	URL          string
+	Title        string
+	FetchedNodes int
 }
 
 type AssignmentEntry struct {

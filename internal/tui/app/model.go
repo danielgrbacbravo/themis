@@ -14,20 +14,25 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"themis-cli/internal/state"
+	"themis-cli/internal/tui/textutil"
+	"themis-cli/internal/tui/theme"
 )
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "33", Dark: "75"})
-	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "242", Dark: "245"})
-	okStyle       = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "42"})
-	staleStyle    = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "136", Dark: "214"})
-	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"})
-	neverStyle    = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "240", Dark: "240"})
-	passStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "42"})
-	failStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"})
-	noneStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "244", Dark: "246"})
-	infoStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "39", Dark: "81"})
-	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "39", Dark: "81"})
+	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(theme.Accent)
+	// Secondary text keeps the terminal foreground: ANSI bright black can be
+	// too faint on light themes. Reserve muted color for decorative marks.
+	secondaryStyle = lipgloss.NewStyle()
+	mutedStyle     = lipgloss.NewStyle().Foreground(theme.Muted)
+	okStyle        = lipgloss.NewStyle().Foreground(theme.Success)
+	staleStyle     = lipgloss.NewStyle().Foreground(theme.Warning)
+	errorStyle     = lipgloss.NewStyle().Foreground(theme.Error)
+	neverStyle     = lipgloss.NewStyle()
+	passStyle      = lipgloss.NewStyle().Foreground(theme.Success)
+	failStyle      = lipgloss.NewStyle().Foreground(theme.Error)
+	noneStyle      = lipgloss.NewStyle()
+	infoStyle      = lipgloss.NewStyle().Foreground(theme.Info)
+	selectedStyle  = lipgloss.NewStyle().Bold(true)
 )
 
 type RefreshScope string
@@ -85,11 +90,9 @@ type refreshFinishedMsg struct {
 	Outcome RefreshOutcome
 }
 
-type downloadFinishedMsg struct {
-	Outcome DownloadOutcome
-}
-
 type downloadFileFinishedMsg struct {
+	Index    int
+	BatchID  uint64
 	AssetURL string
 	Outcome  DownloadOutcome
 }
@@ -101,6 +104,8 @@ type Model struct {
 	subtreeRefreshDepth int
 	refreshExecutor     RefreshExecutor
 	downloadExecutor    DownloadExecutor
+	preview             previewState
+	previewExecutor     PreviewExecutor
 	persistChoices      PersistChoicesFunc
 	defaultDownloadDir  string
 	recentAssetChoices  map[string][]string
@@ -116,16 +121,33 @@ type Model struct {
 	downloadStatus      map[string]string
 	downloadErrorByURL  map[string]string
 	downloadStartedAt   time.Time
+	downloadNodeID      string
+	downloadState       state.State
+	downloadBatchID     uint64
+	courseSummary       state.CourseSummary
 	refreshInFlight     bool
 	expanded            map[string]bool
 	flat                []treeRow
 	selectedIndex       int
+	treeOffset          int
+	detailsOffset       int
+	detailsFocused      bool
+	showHelp            bool
+	helpOffset          int
 	selectedNodeID      string
 	width               int
 	height              int
 	mode                string
 	filter              string
 	statusText          string
+	autoRefreshPending  bool
+	reducedMotion       bool
+	animationFrame      int
+	animationGeneration uint64
+	animationRunning    bool
+	successUntil        time.Time
+	showSource          bool
+	now                 time.Time
 }
 
 type treeRow struct {
@@ -167,11 +189,15 @@ func NewModel(cfg Config) (Model, error) {
 
 	m := Model{
 		st:                  st,
+		autoRefreshPending:  !cfg.DisableAutoRefresh && cfg.RefreshExecutor != nil,
+		reducedMotion:       cfg.ReducedMotion,
+		now:                 now,
 		rootNodeID:          resolvedRootID,
 		linkedRootNodeID:    strings.TrimSpace(cfg.LinkedRootNodeID),
 		subtreeRefreshDepth: depth,
 		refreshExecutor:     cfg.RefreshExecutor,
 		downloadExecutor:    cfg.DownloadExecutor,
+		previewExecutor:     cfg.PreviewExecutor,
 		persistChoices:      cfg.PersistChoices,
 		defaultDownloadDir:  strings.TrimSpace(cfg.DefaultDownloadDir),
 		recentAssetChoices:  cloneChoiceMap(cfg.RecentAssetChoices),
@@ -180,6 +206,7 @@ func NewModel(cfg Config) (Model, error) {
 		downloadStatus:      map[string]string{},
 		downloadErrorByURL:  map[string]string{},
 		downloadOffset:      0,
+		courseSummary:       state.ComputeCourseSummary(st, resolvedRootID, now),
 		expanded: map[string]bool{
 			resolvedRootID: true,
 		},
@@ -189,19 +216,77 @@ func NewModel(cfg Config) (Model, error) {
 		height:         0,
 		mode:           "browse",
 		filter:         "",
-		statusText:     "Cached view (refresh actions enabled)",
+		statusText:     "Cached course · r to refresh",
 	}
 	m.rebuildFlat()
 	return m, nil
 }
 
-func (m Model) Init() tea.Cmd { return nil }
+func (m Model) Init() tea.Cmd {
+	if m.autoRefreshPending {
+		return tea.Batch(func() tea.Msg { return refreshOnOpenMsg{} }, summaryTick())
+	}
+	return summaryTick()
+}
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Normalize viewports after every transition, including asynchronous results.
+	updated, cmd := m.update(msg)
+	next := updated.(Model)
+	if next.selectedNodeID != m.selectedNodeID {
+		next.detailsOffset = 0
+	}
+	if _, tick := msg.(activityTickMsg); !tick {
+		next.adjustViewports()
+	}
+	if previewCmd := next.syncPreview(m.mode); previewCmd != nil {
+		cmd = tea.Batch(cmd, previewCmd)
+	}
+	if !next.reducedMotion && next.animating() && !next.animationRunning {
+		next.animationRunning = true
+		next.animationGeneration++
+		cmd = tea.Batch(cmd, activityTick(next.animationGeneration))
+	}
+	return next, cmd
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case previewStartMsg:
+		return m.startPreview(msg)
+	case previewFinishedMsg:
+		return m.finishPreview(msg)
+	case refreshOnOpenMsg:
+		if !m.autoRefreshPending {
+			return m, nil
+		}
+		m.autoRefreshPending = false
+		if m.refreshInFlight || m.downloadInFlight || m.mode == "download" {
+			return m, nil
+		}
+		scope, depth := RefreshScopeSubtree, maxInt(2, m.subtreeRefreshDepth)
+		if kind := m.st.Nodes[m.rootNodeID].Kind; kind == "catalog" || kind == "year" {
+			scope, depth = RefreshScopeNode, 0
+		}
+		return m.startRefreshAt(m.rootNodeID, scope, depth)
+	case summaryTickMsg:
+		m.now = time.Time(msg)
+		m.courseSummary = state.ComputeCourseSummary(m.st, m.rootNodeID, m.now)
+		return m, summaryTick()
+	case activityTickMsg:
+		if msg.generation != m.animationGeneration {
+			return m, nil
+		}
+		m.now = time.Now()
+		if m.reducedMotion || !m.animating() {
+			m.animationRunning = false
+			return m, nil
+		}
+		m.animationFrame = (m.animationFrame + 1) % 60
+		return m, activityTick(m.animationGeneration)
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
+		m.width = maxInt(0, msg.Width)
+		m.height = maxInt(0, msg.Height)
 		if m.mode == "download" {
 			m.adjustDownloadOffset()
 		}
@@ -213,183 +298,157 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusText = fmt.Sprintf("refresh failed (%s): %v", out.Scope, out.Err)
 			return m, nil
 		}
+		if _, ok := out.State.Nodes[m.rootNodeID]; !ok {
+			m.statusText = "refresh failed: refreshed state is missing the current root"
+			return m, nil
+		}
+		m.now = time.Now()
+		m.successUntil = m.now.Add(900 * time.Millisecond)
 		m.st = out.State
-		m.ensureVisible(out.TargetNodeID)
+		m.courseSummary = state.ComputeCourseSummary(m.st, m.rootNodeID, time.Now())
+		// Preserve the user's current selection while a refresh is running.
+		m.ensureVisible(m.selectedNodeID)
 		m.rebuildFlat()
-		m.selectedNodeID = out.TargetNodeID
-		m.syncSelectedIndex()
-		m.statusText = fmt.Sprintf("refresh finished: scope=%s updated=%d duration=%dms", out.Scope, out.UpdatedNodes, out.DurationMs)
+		m.statusText = fmt.Sprintf("Updated %d items · %.1fs", out.UpdatedNodes, float64(out.DurationMs)/1000)
 		if len(out.Warnings) > 0 {
 			m.statusText += fmt.Sprintf(" warnings=%d", len(out.Warnings))
 		}
 		return m, nil
-	case downloadFinishedMsg:
-		m.downloadInFlight = false
-		m.mode = "browse"
-		out := msg.Outcome
-		if out.Err != nil {
-			m.statusText = fmt.Sprintf("download failed: %v", out.Err)
+	case downloadFileFinishedMsg:
+		if !m.downloadInFlight || msg.BatchID != m.downloadBatchID || msg.Index != m.downloadCurrent || m.downloadCurrent >= len(m.downloadQueue) || msg.AssetURL != m.downloadQueue[m.downloadCurrent].URL {
 			return m, nil
 		}
-		if m.persistChoices != nil {
-			selected := m.selectedAssetURLs()
-			if err := m.persistChoices(out.NodeID, selected, out.TargetDir); err != nil {
-				m.statusText = fmt.Sprintf("download finished (%d files), persist failed: %v", out.Downloaded, err)
-				return m, nil
-			}
-			m.recentAssetChoices[out.NodeID] = selected
-		}
-		m.defaultDownloadDir = out.TargetDir
-		m.statusText = fmt.Sprintf("download finished: %d files to %s in %dms", out.Downloaded, out.TargetDir, out.DurationMs)
-		return m, nil
-	case downloadFileFinishedMsg:
 		m.handleDownloadFileResult(msg.AssetURL, msg.Outcome)
 		if m.downloadCurrent < len(m.downloadQueue) {
 			return m, m.downloadNextCmd()
 		}
 		return m.finalizeDownloadBatch(), nil
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
+		key := msg.String()
+		if key == "ctrl+c" || key == "q" {
+			m.cancelPreview()
 			return m, tea.Quit
+		}
+		if key == "?" {
+			m.helpOffset = 0
+			m.showHelp = !m.showHelp
+			return m, nil
+		}
+		if m.showHelp {
+			switch key {
+			case "esc":
+				m.showHelp = false
+			case "j", "down":
+				m.helpOffset++
+			case "k", "up":
+				m.helpOffset--
+			case "pgdown":
+				m.helpOffset += maxInt(1, m.panelContentHeight()-1)
+			case "pgup":
+				m.helpOffset -= maxInt(1, m.panelContentHeight()-1)
+			case "g", "home":
+				m.helpOffset = 0
+			case "G", "end":
+				m.helpOffset = len(m.helpLines())
+			}
+			return m, nil
+		}
+		if m.mode == "download" {
+			return m.updateDownloadKey(key)
+		}
+		if key == "i" {
+			m.showSource = !m.showSource
+			m.detailsOffset = 0
+			m.detailsFocused = true
+			return m, nil
+		}
+		if key == "tab" || key == "shift+tab" {
+			m.detailsFocused = !m.detailsFocused
+			return m, nil
+		}
+		if key == "esc" {
+			m.detailsFocused = false
+			return m, nil
+		}
+		if m.detailsFocused {
+			switch key {
+			case "up", "k":
+				m.detailsOffset--
+			case "down", "j":
+				m.detailsOffset++
+			case "pgup":
+				m.detailsOffset -= maxInt(1, m.panelContentHeight()-2)
+			case "pgdown":
+				m.detailsOffset += maxInt(1, m.panelContentHeight()-2)
+			case "g", "home":
+				m.detailsOffset = 0
+			case "G", "end":
+				m.detailsOffset = len(m.detailsLines(m.layout().detailsWidth - 2))
+			}
+			if key != "r" && key != "R" && key != "f" && key != "d" && key != "p" {
+				return m, nil
+			}
+		}
+		switch key {
 		case "up", "k":
-			if m.mode == "download" {
-				if m.downloadCursor > 0 {
-					m.downloadCursor--
-				}
-				m.adjustDownloadOffset()
-				return m, nil
-			}
-			if m.selectedIndex > 0 {
-				m.selectedIndex--
-				m.syncSelectedNodeID()
-			}
+			m.selectedIndex--
+			m.syncSelectedNodeID()
 		case "down", "j":
-			if m.mode == "download" {
-				assets := m.selectedNodeAssets()
-				if m.downloadCursor < len(assets)-1 {
-					m.downloadCursor++
-				}
-				m.adjustDownloadOffset()
-				return m, nil
-			}
-			if m.selectedIndex < len(m.flat)-1 {
-				m.selectedIndex++
-				m.syncSelectedNodeID()
-			}
+			m.selectedIndex++
+			m.syncSelectedNodeID()
 		case "left", "h":
-			if m.mode == "download" {
-				m.mode = "browse"
-				m.statusText = "download mode closed"
-				m.resetDownloadProgress()
-				return m, nil
-			}
 			m.collapseOrMoveToParent()
-		case "right", "l":
+		case "right", "l", "enter":
 			m.expandSelection()
-		case "g":
+		case "g", "home":
 			m.selectedIndex = 0
 			m.syncSelectedNodeID()
-		case "G":
-			if len(m.flat) > 0 {
-				m.selectedIndex = len(m.flat) - 1
-				m.syncSelectedNodeID()
+		case "G", "end":
+			m.selectedIndex = len(m.flat) - 1
+			m.syncSelectedNodeID()
+		case "pgup", "pgdown":
+			step := maxInt(1, m.panelContentHeight()-2)
+			if key == "pgup" {
+				step = -step
 			}
+			m.selectedIndex += step
+			m.syncSelectedNodeID()
 		case "p":
 			if m.linkedRootNodeID == "" {
 				m.statusText = "no linked project root configured"
 				return m, nil
 			}
 			if !m.ensureVisible(m.linkedRootNodeID) {
-				m.statusText = "linked project root not found in state"
+				m.statusText = "linked project root not found in current tree"
 				return m, nil
 			}
 			m.selectedNodeID = m.linkedRootNodeID
-			m.syncSelectedIndex()
+			m.rebuildFlat()
+			m.detailsFocused = false
 			m.statusText = "jumped to linked project root"
-			return m, nil
 		case "d":
-			if m.mode == "download" {
-				m.mode = "browse"
-				m.statusText = "download mode closed"
-				m.resetDownloadProgress()
-				return m, nil
-			}
 			return m.openDownloadMode()
-		case " ":
-			if m.mode == "download" {
-				m.toggleDownloadSelectionAtCursor()
-				return m, nil
-			}
-		case "a":
-			if m.mode == "download" {
-				for _, asset := range m.selectedNodeAssets() {
-					m.downloadSelection[asset.URL] = true
-				}
-				return m, nil
-			}
-		case "c":
-			if m.mode == "download" {
-				m.downloadSelection = map[string]bool{}
-				return m, nil
-			}
 		case "r":
 			return m.startRefresh(RefreshScopeNode, 0)
 		case "R":
 			return m.startRefresh(RefreshScopeSubtree, m.subtreeRefreshDepth)
 		case "f":
 			return m.startRefresh(RefreshScopeFull, m.subtreeRefreshDepth)
-		case "enter":
-			if m.mode == "download" {
-				return m.startDownload()
-			}
-			m.expandSelection()
 		}
+
 	}
 	return m, nil
 }
 
-func (m Model) View() string {
-	if len(m.flat) == 0 {
-		return "No nodes to display"
-	}
-	if m.width <= 0 || m.height <= 0 {
-		return "Loading UI..."
-	}
-
-	availableWidth := maxInt(20, m.width)
-	availableHeight := maxInt(6, m.height)
-
-	statusStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
-	statusFrameW, statusFrameH := statusStyle.GetFrameSize()
-	statusContentWidth := maxInt(1, availableWidth-statusFrameW)
-	statusPane := statusStyle.Width(statusContentWidth).Render(truncateOneLine(m.renderStatus(), statusContentWidth))
-	statusTotalHeight := lipgloss.Height(statusPane)
-	if statusTotalHeight < statusFrameH+1 {
-		statusTotalHeight = statusFrameH + 1
-	}
-
-	topHeight := availableHeight - statusTotalHeight
-	if topHeight < 3 {
-		topHeight = 3
-	}
-
-	panelStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Align(lipgloss.Left, lipgloss.Top)
-	panelFrameW, panelFrameH := panelStyle.GetFrameSize()
-	leftOuterWidth := maxInt(10, availableWidth/2)
-	rightOuterWidth := maxInt(10, availableWidth-leftOuterWidth)
-	leftContentWidth := maxInt(1, leftOuterWidth-panelFrameW)
-	rightContentWidth := maxInt(1, rightOuterWidth-panelFrameW)
-	panelContentHeight := maxInt(1, topHeight-panelFrameH)
-
-	treePane := panelStyle.Width(leftContentWidth).Height(panelContentHeight).Render(m.renderTreeForHeight(panelContentHeight))
-	detailsPane := panelStyle.Width(rightContentWidth).Height(panelContentHeight).Render(m.renderDetailsForSize(rightContentWidth, panelContentHeight))
-
-	top := lipgloss.JoinHorizontal(lipgloss.Top, treePane, detailsPane)
-	return lipgloss.JoinVertical(lipgloss.Left, top, statusPane)
+func (m Model) startRefresh(scope RefreshScope, depth int) (tea.Model, tea.Cmd) {
+	return m.startRefreshAt(m.selectedNodeID, scope, depth)
 }
 
-func (m Model) startRefresh(scope RefreshScope, depth int) (tea.Model, tea.Cmd) {
+func (m Model) startRefreshAt(nodeID string, scope RefreshScope, depth int) (tea.Model, tea.Cmd) {
+	if m.downloadInFlight {
+		m.statusText = "wait for the download to finish before refreshing"
+		return m, nil
+	}
 	if m.refreshInFlight {
 		m.statusText = "refresh already in progress"
 		return m, nil
@@ -398,8 +457,8 @@ func (m Model) startRefresh(scope RefreshScope, depth int) (tea.Model, tea.Cmd) 
 		m.statusText = "refresh unavailable (read-only mode)"
 		return m, nil
 	}
-	node := m.selectedNode()
-	if node == nil {
+	node, exists := m.st.Nodes[nodeID]
+	if !exists {
 		m.statusText = "no selected node"
 		return m, nil
 	}
@@ -414,9 +473,13 @@ func (m Model) startRefresh(scope RefreshScope, depth int) (tea.Model, tea.Cmd) 
 		depth = 0
 	}
 
+	stSnapshot, err := snapshotState(m.st)
+	if err != nil {
+		m.statusText = fmt.Sprintf("refresh failed: %v", err)
+		return m, nil
+	}
 	m.refreshInFlight = true
-	m.statusText = fmt.Sprintf("refreshing %s...", scope)
-	stSnapshot := m.st
+	m.statusText = "Updating " + displayTitle(node) + "…"
 	exec := m.refreshExecutor
 	req := RefreshRequest{
 		Scope:        scope,
@@ -433,8 +496,18 @@ func (m Model) startRefresh(scope RefreshScope, depth int) (tea.Model, tea.Cmd) 
 }
 
 func (m Model) openDownloadMode() (tea.Model, tea.Cmd) {
+	if m.refreshInFlight {
+		m.statusText = "wait for the refresh to finish before choosing downloads"
+		return m, nil
+	}
 	if m.downloadInFlight {
-		m.statusText = "download already in progress"
+		m.ensureVisible(m.downloadNodeID)
+		m.selectedNodeID = m.downloadNodeID
+		m.rebuildFlat()
+		m.mode = "download"
+		if m.downloadCurrent < len(m.downloadQueue) {
+			m.focusDownloadAsset(m.downloadQueue[m.downloadCurrent].URL)
+		}
 		return m, nil
 	}
 	assets := m.selectedNodeAssets()
@@ -508,6 +581,14 @@ func (m Model) startDownload() (tea.Model, tea.Cmd) {
 		targetDir = filepath.Join(".", "tests")
 	}
 
+	snapshot, err := snapshotState(m.st)
+	if err != nil {
+		m.statusText = fmt.Sprintf("download failed: %v", err)
+		return m, nil
+	}
+	m.downloadState = snapshot
+	m.downloadNodeID = node.ID
+	m.downloadBatchID++
 	m.downloadInFlight = true
 	m.downloadQueue = append([]state.AssetRef{}, selected...)
 	m.downloadTargetDir = targetDir
@@ -532,7 +613,13 @@ func (m Model) selectedNodeAssets() []state.AssetRef {
 	if node == nil {
 		return []state.AssetRef{}
 	}
-	return append([]state.AssetRef{}, node.Assets...)
+	assets := make([]state.AssetRef, 0, len(node.Assets))
+	for _, asset := range node.Assets {
+		if !state.IsSiteInfoURL(asset.URL) {
+			assets = append(assets, asset)
+		}
+	}
+	return assets
 }
 
 func (m Model) selectedAssets() []state.AssetRef {
@@ -571,7 +658,7 @@ func (m *Model) rebuildFlat() {
 			Title:       displayTitle(node),
 			URL:         node.CanonicalURL,
 			Status:      node.Status,
-			ResultLabel: nodeResultLabel(node),
+			ResultLabel: m.nodeResultLabel(node),
 			HasChildren: len(node.ChildIDs) > 0,
 			Expanded:    m.expanded[nodeID],
 			ParentID:    parentID,
@@ -597,25 +684,35 @@ func (m *Model) rebuildFlat() {
 	m.syncSelectedIndex()
 }
 
+// Follow actual child edges from the displayed root. Parent metadata may be
+// missing, cyclic, or describe a different root in the cached graph.
 func (m *Model) ensureVisible(nodeID string) bool {
-	if nodeID == "" {
+	if _, ok := m.st.Nodes[nodeID]; !ok {
 		return false
 	}
-	node, ok := m.st.Nodes[nodeID]
-	if !ok {
-		return false
-	}
-	current := node
-	for len(current.ParentIDs) > 0 {
-		parentID := current.ParentIDs[0]
-		m.expanded[parentID] = true
-		parent, ok := m.st.Nodes[parentID]
-		if !ok {
-			break
+	parents := map[string]string{m.rootNodeID: ""}
+	queue := []string{m.rootNodeID}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if id == nodeID {
+			for parent := parents[id]; parent != ""; parent = parents[parent] {
+				m.expanded[parent] = true
+			}
+			return true
 		}
-		current = parent
+		for _, child := range m.st.Nodes[id].ChildIDs {
+			if _, seen := parents[child]; seen {
+				continue
+			}
+			if _, exists := m.st.Nodes[child]; !exists {
+				continue
+			}
+			parents[child] = id
+			queue = append(queue, child)
+		}
 	}
-	return true
+	return false
 }
 
 func (m *Model) syncSelectedIndex() {
@@ -700,216 +797,86 @@ func (m *Model) collapseOrMoveToParent() {
 	}
 }
 
-func (m Model) renderTree() string {
-	lines := make([]string, 0, len(m.flat)+1)
-	lines = append(lines, titleStyle.Render("Tree"))
-	for i, row := range m.flat {
-		prefix := "  "
-		if i == m.selectedIndex {
-			prefix = "> "
+func (m Model) renderCourseSummary(maxWidth int, maxLines int) string {
+	summary := m.courseSummary
+	lines := []string{titleStyle.Render("Course Summary")}
+	if summary.TotalAssignments == 0 {
+		lines = append(lines, secondaryStyle.Render("No assignments with deadlines or status data in this cached tree."))
+		return textutil.Fit(strings.Join(lines, "\n"), maxWidth, maxLines)
+	}
+
+	completion := fmt.Sprintf("Submitted %d/%d (%d%%), passed %d",
+		summary.SubmittedAssignments,
+		summary.TotalAssignments,
+		summary.CompletionPercent,
+		summary.PassedAssignments,
+	)
+	if len(summary.OverdueAssignments) > 0 {
+		completion += fmt.Sprintf(" - warning: %d overdue unsubmitted", len(summary.OverdueAssignments))
+	} else if dueSoonUnsubmitted(summary, 3) > 0 {
+		completion += fmt.Sprintf(" - warning: %d due soon unsubmitted", dueSoonUnsubmitted(summary, 3))
+	}
+	if maxWidth >= 70 {
+		completion = progressBar(summary.SubmittedAssignments, summary.TotalAssignments, 10) + "  " + completion
+	}
+	lines = append(lines, completion)
+
+	// Keep the next deadline visible even when an older task is overdue;
+	// the completion line already reports the overdue warning.
+	if len(summary.UpcomingDeadlines) > 0 {
+		group := summary.UpcomingDeadlines[0]
+		unit := "days"
+		if group.DaysUntil == 1 {
+			unit = "day"
 		}
-		indent := strings.Repeat("  ", row.Depth)
-		expandGlyph := "-"
-		if row.HasChildren {
-			if row.Expanded {
-				expandGlyph = "v"
-			} else {
-				expandGlyph = ">"
+		if group.DaysUntil == 0 {
+			lines = append(lines, fmt.Sprintf("Due today for these %d: %s", len(group.Assignments), assignmentNameList(group.Assignments, 4)))
+		} else {
+			lines = append(lines, fmt.Sprintf("%d %s until deadline for these %d: %s", group.DaysUntil, unit, len(group.Assignments), assignmentNameList(group.Assignments, 4)))
+		}
+	} else if len(summary.OverdueAssignments) > 0 {
+		lines = append(lines, fmt.Sprintf("Overdue: %s", assignmentNameList(summary.OverdueAssignments, 4)))
+	} else {
+		lines = append(lines, secondaryStyle.Render("No upcoming deadlines found in cached assignment metadata."))
+	}
+
+	return textutil.Fit(strings.Join(lines, "\n"), maxWidth, maxLines)
+}
+
+func dueSoonUnsubmitted(summary state.CourseSummary, maxDays int) int {
+	count := 0
+	for _, group := range summary.UpcomingDeadlines {
+		if group.DaysUntil > maxDays {
+			continue
+		}
+		for _, item := range group.Assignments {
+			if !item.Submitted {
+				count++
 			}
 		}
-		resultTag := colorResultTag(row.ResultLabel, row.Status)
-		freshTag := colorFreshnessTag(row.Status)
-		line := fmt.Sprintf("%s%s%s %s %s", prefix, indent, mutedStyle.Render(expandGlyph), resultTag, row.Title)
-		if strings.TrimSpace(freshTag) != "" {
-			line += " " + freshTag
-		}
-		if i == m.selectedIndex {
-			line = selectedStyle.Render(line)
-		}
-		lines = append(lines, line)
 	}
-	return strings.Join(lines, "\n")
+	return count
 }
 
-func (m Model) renderTreeForHeight(maxLines int) string {
-	return clipTopLines(m.renderTree(), maxLines)
-}
-
-func (m Model) renderDetailsForSize(maxWidth int, maxLines int) string {
-	return clipTopLines(m.renderDetails(maxWidth, maxLines), maxLines)
-}
-
-func (m Model) renderDetails(maxWidth int, maxLines int) string {
-	node := m.selectedNode()
-	if node == nil {
-		return titleStyle.Render("Details") + "\n" + mutedStyle.Render("(no selection)")
+func assignmentNameList(assignments []state.AssignmentDeadline, limit int) string {
+	if len(assignments) == 0 {
+		return "none"
 	}
-	if m.mode == "download" {
-		return m.renderDownloadPanel(*node, maxWidth, maxLines)
+	if limit <= 0 || limit > len(assignments) {
+		limit = len(assignments)
 	}
-
-	lines := []string{
-		titleStyle.Render("Details"),
-		fmt.Sprintf("Name: %s", displayTitle(*node)),
-		fmt.Sprintf("Type: %s", readableKind(node.Kind)),
-		fmt.Sprintf("Result: %s", colorResultWord(nodeResultLabel(*node))),
-		fmt.Sprintf("Freshness: %s", colorStatusWord(node.Status)),
-	}
-	if node.CanonicalURL != "" {
-		lines = append(lines, fmt.Sprintf("Path: %s", node.CanonicalURL))
-	}
-
-	lines = append(lines, "")
-	lines = append(lines, fmt.Sprintf("Children: %d", len(node.ChildIDs)))
-	lines = append(lines, fmt.Sprintf("Files: %d", len(node.Assets)))
-
-	if statusPage := statusPageURL(node.Details); statusPage != "" {
-		lines = append(lines, fmt.Sprintf("Status page: %s", statusPage))
-	}
-	if statsLines := statsSummaryLines(node.Details); len(statsLines) > 0 {
-		lines = append(lines, "")
-		lines = append(lines, titleStyle.Render("Stats:"))
-		lines = append(lines, statsLines...)
-	} else if statusPageURL(node.Details) != "" {
-		lines = append(lines, mutedStyle.Render("Stats: not loaded yet (refresh this node)"))
-	}
-	if debugLines := statsDebugLines(node.Details); len(debugLines) > 0 {
-		lines = append(lines, "")
-		lines = append(lines, titleStyle.Render("Stats Debug:"))
-		lines = append(lines, debugLines...)
-	}
-
-	if node.LastSuccessAt != nil {
-		lines = append(lines, fmt.Sprintf("Fresh at: %s", node.LastSuccessAt.Local().Format("2006-01-02 15:04")))
-	}
-	if node.LastFetchedAt != nil && node.LastSuccessAt != nil {
-		if node.LastFetchedAt.After(*node.LastSuccessAt) {
-			lines = append(lines, fmt.Sprintf("Last fetch: %s", node.LastFetchedAt.Local().Format("2006-01-02 15:04")))
-		}
-	}
-	if node.LastError != "" {
-		lines = append(lines, fmt.Sprintf("Error: %s", node.LastError))
-	}
-
-	if desc, ok := node.Details["description"].(string); ok && strings.TrimSpace(desc) != "" {
-		lines = append(lines, "")
-		lines = append(lines, titleStyle.Render("Summary:"))
-		lines = append(lines, strings.TrimSpace(desc))
-	}
-
-	if breadcrumb := breadcrumbString(node.Details); breadcrumb != "" {
-		lines = append(lines, "")
-		lines = append(lines, fmt.Sprintf("Location: %s", breadcrumb))
-	}
-
-	if configLines := configSummaryLines(node.Details); len(configLines) > 0 {
-		lines = append(lines, "")
-		lines = append(lines, titleStyle.Render("Configuration:"))
-		lines = append(lines, configLines...)
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-func (m Model) renderStatus() string {
-	selected := "none"
-	if row := m.selectedRow(); row != nil {
-		selected = row.Title
-	}
-	inFlight := "idle"
-	if m.refreshInFlight {
-		inFlight = "refreshing"
-	}
-	if m.downloadInFlight {
-		inFlight = "downloading"
-	}
-	keys := "j/k move h/l fold enter open r node R subtree f full d download p project q quit"
-	if m.mode == "download" {
-		keys = "j/k move space toggle a all c clear enter download h/d close q quit"
-	}
-	if m.downloadInFlight {
-		keys = "j/k move (live progress) h/d close q quit"
-	}
-	msg := strings.TrimSpace(m.statusText)
-	modeText := titleStyle.Render(strings.ToUpper(m.mode))
-	stateText := mutedStyle.Render(inFlight)
-	selectedText := selected
-	if selected != "none" {
-		selectedText = selectedStyle.Render(selected)
-	}
-	keysText := mutedStyle.Render(keys)
-	if msg != "" {
-		return fmt.Sprintf("%s | %s | %s | %s | %s", modeText, stateText, selectedText, keysText, msg)
-	}
-	return fmt.Sprintf("%s | %s | %s | %s", modeText, stateText, selectedText, keysText)
-}
-
-func (m Model) renderDownloadPanel(node state.Node, maxWidth int, maxLines int) string {
-	assets := m.selectedNodeAssets()
-	header := []string{
-		titleStyle.Render("Download"),
-		fmt.Sprintf("Node: %s", displayTitle(node)),
-		fmt.Sprintf("Target dir: %s", m.defaultDownloadDir),
-		mutedStyle.Render("Keys: j/k move, space toggle, a all, c clear, enter download"),
-		"",
-	}
-	for i := range header {
-		header[i] = truncateOneLine(header[i], maxWidth)
-	}
-	if len(assets) == 0 {
-		header = append(header, "(no assets available)")
-		return strings.Join(header, "\n")
-	}
-	assetLines := make([]string, 0, len(assets))
-	for i, asset := range assets {
-		cursor := " "
-		if i == m.downloadCursor {
-			cursor = ">"
-		}
-		mark := colorDownloadMarker(m.downloadMarker(asset.URL))
-		name := strings.TrimSpace(asset.Name)
+	names := make([]string, 0, limit+1)
+	for i := 0; i < limit; i++ {
+		name := strings.TrimSpace(assignments[i].Title)
 		if name == "" {
-			name = asset.URL
+			name = assignments[i].NodeID
 		}
-		line := fmt.Sprintf("%s [%s] %s (%s)", cursor, mark, name, asset.Kind)
-		assetLines = append(assetLines, truncateOneLine(line, maxWidth))
+		names = append(names, name)
 	}
-	footer := fmt.Sprintf("Selected: %d/%d", len(m.selectedAssetURLs()), len(assets))
-	if m.downloadInFlight || (m.downloadDone+m.downloadFailed) > 0 {
-		footer = fmt.Sprintf("Progress: %d/%d done, %d failed", m.downloadDone, len(m.downloadQueue), m.downloadFailed)
+	if len(assignments) > limit {
+		names = append(names, fmt.Sprintf("+%d more", len(assignments)-limit))
 	}
-	footer = truncateOneLine(footer, maxWidth)
-
-	if maxLines <= len(header)+1 {
-		lines := append([]string{}, header...)
-		lines = append(lines, footer)
-		return strings.Join(clipLines(lines, maxLines), "\n")
-	}
-
-	listHeight := maxLines - len(header) - 1
-	if listHeight < 1 {
-		listHeight = 1
-	}
-	start := m.downloadOffset
-	if start < 0 {
-		start = 0
-	}
-	maxStart := len(assetLines) - listHeight
-	if maxStart < 0 {
-		maxStart = 0
-	}
-	if start > maxStart {
-		start = maxStart
-	}
-	end := start + listHeight
-	if end > len(assetLines) {
-		end = len(assetLines)
-	}
-
-	lines := append([]string{}, header...)
-	lines = append(lines, assetLines[start:end]...)
-	lines = append(lines, footer)
-	return strings.Join(lines, "\n")
+	return strings.Join(names, ", ")
 }
 
 func defaultRootNodeID(st state.State) string {
@@ -993,34 +960,9 @@ func cloneChoiceMap(in map[string][]string) map[string][]string {
 }
 
 func (m *Model) adjustDownloadOffset() {
-	assets := m.selectedNodeAssets()
-	if len(assets) == 0 {
-		m.downloadOffset = 0
-		return
-	}
-	listHeight := m.downloadListHeight()
-	if listHeight < 1 {
-		listHeight = 1
-	}
-	if m.downloadOffset < 0 {
-		m.downloadOffset = 0
-	}
-	maxOffset := len(assets) - listHeight
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
-	if m.downloadOffset > maxOffset {
-		m.downloadOffset = maxOffset
-	}
-	if m.downloadCursor < m.downloadOffset {
-		m.downloadOffset = m.downloadCursor
-	}
-	if m.downloadCursor >= m.downloadOffset+listHeight {
-		m.downloadOffset = m.downloadCursor - listHeight + 1
-	}
-	if m.downloadOffset < 0 {
-		m.downloadOffset = 0
-	}
+	count := len(m.selectedNodeAssets())
+	m.downloadCursor = clamp(m.downloadCursor, 0, maxInt(0, count-1))
+	m.downloadOffset = visibleOffset(m.downloadOffset, m.downloadCursor, count, m.downloadListHeight())
 }
 
 func (m Model) downloadNextCmd() tea.Cmd {
@@ -1031,21 +973,18 @@ func (m Model) downloadNextCmd() tea.Cmd {
 		return nil
 	}
 	asset := m.downloadQueue[m.downloadCurrent]
-	node := m.selectedNode()
-	if node == nil {
-		return nil
-	}
-
-	stSnapshot := m.st
+	stSnapshot := m.downloadState
+	batchID := m.downloadBatchID
+	index := m.downloadCurrent
 	exec := m.downloadExecutor
 	req := DownloadRequest{
-		NodeID:    node.ID,
+		NodeID:    m.downloadNodeID,
 		TargetDir: m.downloadTargetDir,
 		Assets:    []state.AssetRef{asset},
 	}
 	return func() tea.Msg {
 		out := exec(stSnapshot, req)
-		return downloadFileFinishedMsg{AssetURL: asset.URL, Outcome: out}
+		return downloadFileFinishedMsg{Index: index, BatchID: batchID, AssetURL: asset.URL, Outcome: out}
 	}
 }
 
@@ -1070,23 +1009,28 @@ func (m *Model) handleDownloadFileResult(assetURL string, out DownloadOutcome) {
 
 func (m Model) finalizeDownloadBatch() Model {
 	m.downloadInFlight = false
+	m.now = time.Now()
+	m.successUntil = m.now.Add(900 * time.Millisecond)
+	m.downloadState = state.State{}
 	duration := time.Since(m.downloadStartedAt).Milliseconds()
 	m.defaultDownloadDir = m.downloadTargetDir
-
-	if m.persistChoices != nil {
-		selected := m.selectedAssetURLs()
-		if node := m.selectedNode(); node != nil {
-			if err := m.persistChoices(node.ID, selected, m.downloadTargetDir); err == nil {
-				m.recentAssetChoices[node.ID] = selected
-			}
-		}
-	}
 
 	if m.downloadFailed > 0 {
 		m.statusText = fmt.Sprintf("download finished: %d ok, %d failed in %dms", m.downloadDone, m.downloadFailed, duration)
 	} else {
 		m.statusText = fmt.Sprintf("download finished: %d files in %dms", m.downloadDone, duration)
 	}
+	selected := make([]string, 0, len(m.downloadQueue))
+	for _, asset := range m.downloadQueue {
+		selected = append(selected, asset.URL)
+	}
+	m.recentAssetChoices[m.downloadNodeID] = selected
+	if m.persistChoices != nil {
+		if err := m.persistChoices(m.downloadNodeID, selected, m.downloadTargetDir); err != nil {
+			m.statusText += fmt.Sprintf("; saving choices failed: %v", err)
+		}
+	}
+
 	return m
 }
 
@@ -1100,6 +1044,8 @@ func (m *Model) resetDownloadProgress() {
 	m.downloadStatus = map[string]string{}
 	m.downloadErrorByURL = map[string]string{}
 	m.downloadStartedAt = time.Time{}
+	m.downloadState = state.State{}
+	m.downloadNodeID = ""
 }
 
 func (m Model) downloadMarker(assetURL string) string {
@@ -1122,35 +1068,11 @@ func (m Model) downloadMarker(assetURL string) string {
 }
 
 func (m Model) downloadListHeight() int {
-	// Download header is 5 lines, footer is 1 line.
-	listHeight := m.panelContentHeight() - 6
-	if listHeight < 1 {
-		return 1
-	}
-	return listHeight
+	header, footer := downloadChrome(m.panelContentHeight())
+	return maxInt(1, m.panelContentHeight()-header-footer)
 }
 
-func (m Model) panelContentHeight() int {
-	if m.width <= 0 || m.height <= 0 {
-		return 1
-	}
-	availableHeight := maxInt(6, m.height)
-	statusStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
-	_, statusFrameH := statusStyle.GetFrameSize()
-	statusHeight := statusFrameH + 1 // one-line status content
-
-	topHeight := availableHeight - statusHeight
-	if topHeight < 3 {
-		topHeight = 3
-	}
-	panelStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
-	_, panelFrameH := panelStyle.GetFrameSize()
-	contentHeight := topHeight - panelFrameH
-	if contentHeight < 1 {
-		return 1
-	}
-	return contentHeight
-}
+func (m Model) panelContentHeight() int { return maxInt(1, m.layout().bodyHeight-2) }
 
 func colorStatusTag(s state.Status) string {
 	tag := fmt.Sprintf("[%s]", s)
@@ -1164,7 +1086,7 @@ func colorStatusTag(s state.Status) string {
 	case state.StatusNever:
 		return neverStyle.Render(tag)
 	default:
-		return mutedStyle.Render(tag)
+		return secondaryStyle.Render(tag)
 	}
 }
 
@@ -1189,12 +1111,12 @@ func colorResultTag(result string, freshness state.Status) string {
 		if freshness == state.StatusError {
 			return errorStyle.Render(tag)
 		}
-		return mutedStyle.Render(tag)
+		return secondaryStyle.Render(tag)
 	default:
 		if isGradeLike(result) {
 			return infoStyle.Render(tag)
 		}
-		return mutedStyle.Render(tag)
+		return secondaryStyle.Render(tag)
 	}
 }
 
@@ -1207,7 +1129,7 @@ func colorFreshnessTag(s state.Status) string {
 	case state.StatusNever:
 		return neverStyle.Render("(never)")
 	default:
-		return mutedStyle.Render("")
+		return secondaryStyle.Render("")
 	}
 }
 
@@ -1223,7 +1145,7 @@ func colorStatusWord(s state.Status) string {
 	case state.StatusNever:
 		return neverStyle.Render(word)
 	default:
-		return mutedStyle.Render(word)
+		return secondaryStyle.Render(word)
 	}
 }
 
@@ -1253,7 +1175,7 @@ func colorDownloadMarker(mark string) string {
 	case "…":
 		return selectedStyle.Render(mark)
 	case "·":
-		return mutedStyle.Render(mark)
+		return secondaryStyle.Render(mark)
 	default:
 		return mark
 	}
@@ -1294,6 +1216,20 @@ func readableKind(kind string) string {
 	}
 }
 
+func (m Model) nodeResultLabel(node state.Node) string {
+	if len(node.ChildIDs) > 0 {
+		progress := state.ComputeTaskProgress(m.st, node.ID)
+		if progress.Complete {
+			return "passed"
+		}
+		if progress.Submitted > 0 {
+			return "in_progress"
+		}
+		return "not_started"
+	}
+	return nodeResultLabel(node)
+}
+
 func nodeResultLabel(node state.Node) string {
 	if strings.TrimSpace(strings.ToLower(node.Kind)) != "assignment" {
 		switch node.Status {
@@ -1315,7 +1251,7 @@ func nodeResultLabel(node state.Node) string {
 	statusText := normalizeStatsKey(stringAnyMapGetString(summary, "status_text"))
 	combined := strings.TrimSpace(status + " " + statusText)
 
-	if containsAny(combined, "passed", "pass") {
+	if status == "accepted" || statusText == "accepted" || containsAny(combined, "passed", "pass") {
 		return "passed"
 	}
 	if containsAny(combined, "failed", "failing", "wrong", "error", "timeout", "diff", "runtime") {
@@ -1373,22 +1309,15 @@ func breadcrumbString(details map[string]any) string {
 }
 
 func configSummaryLines(details map[string]any) []string {
-	raw, ok := details["config"]
-	if !ok {
-		return nil
-	}
-	cfg, ok := raw.(map[string]any)
-	if !ok {
-		return nil
-	}
-	lines := make([]string, 0, 3)
+	cfg := state.AssignmentConfig(details)
+	lines := make([]string, 0, 5)
 	if v, ok := cfg["leading_submission"]; ok {
 		lines = append(lines, fmt.Sprintf("- Leading submission: %v", v))
 	}
-	if v, ok := cfg["end_display"]; ok {
-		lines = append(lines, fmt.Sprintf("- Due: %v", v))
-	} else if v, ok := cfg["end_iso"]; ok {
-		lines = append(lines, fmt.Sprintf("- Due: %v", v))
+	for _, field := range []struct{ key, label string }{{"start", "Opens"}, {"deadline", "Deadline"}, {"end", "Submissions close"}} {
+		if date, display := state.ConfigDate(cfg, field.key); !date.IsZero() {
+			lines = append(lines, fmt.Sprintf("- %s: %s", field.label, display))
+		}
 	}
 	if v, ok := cfg["sort"]; ok {
 		lines = append(lines, fmt.Sprintf("- Sorted: %v", v))
@@ -1698,27 +1627,25 @@ func clipLines(lines []string, maxLines int) []string {
 	return lines[:maxLines]
 }
 
+func wrapLines(lines []string, maxWidth int) string {
+	return textutil.Wrap(strings.Join(lines, "\n"), maxWidth)
+}
+
 func truncateOneLine(content string, maxWidth int) string {
-	line := strings.Split(content, "\n")[0]
-	if maxWidth <= 0 {
-		return ""
+	return textutil.Truncate(content, maxWidth)
+}
+
+// State contains nested maps and slices; a shallow copy races with View while
+// the executor updates the cache. Its persisted JSON representation provides
+// an isolated snapshot and validates unsupported values before dispatch.
+func snapshotState(st state.State) (state.State, error) {
+	data, err := json.Marshal(st)
+	if err != nil {
+		return state.State{}, fmt.Errorf("snapshot state: %w", err)
 	}
-	if lipgloss.Width(line) <= maxWidth {
-		return line
+	var snapshot state.State
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return state.State{}, fmt.Errorf("snapshot state: %w", err)
 	}
-	if maxWidth == 1 {
-		return "…"
-	}
-	limit := maxWidth - 1
-	var b strings.Builder
-	currentWidth := 0
-	for _, r := range line {
-		rw := lipgloss.Width(string(r))
-		if currentWidth+rw > limit {
-			break
-		}
-		b.WriteRune(r)
-		currentWidth += rw
-	}
-	return b.String() + "…"
+	return snapshot, nil
 }

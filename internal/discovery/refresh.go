@@ -107,6 +107,13 @@ func (s *Service) RefreshNode(client *http.Client, st *state.State, targetURL st
 			return
 		}
 		result.FetchedNodes++
+		if s.Progress != nil {
+			s.Progress(RefreshProgress{
+				URL:          snap.Canonical,
+				Title:        snap.Title,
+				FetchedNodes: result.FetchedNodes,
+			})
+		}
 
 		nodeID := state.NodeIDFromCanonicalURL(snap.Canonical)
 		current, exists := st.Nodes[nodeID]
@@ -684,18 +691,29 @@ func extractDetails(doc *goquery.Document, canonicalURL string) map[string]any {
 
 	config := map[string]any{}
 	doc.Find(".ass-config .cfg-line").Each(func(_ int, sel *goquery.Selection) {
-		key := normalizeConfigKey(sel.Find(".cfg-key").First().Text())
+		keySel := sel.Find(".cfg-key").First().Clone()
+		keySel.Find(".tip-text, [role=tooltip]").Remove()
+		key := normalizeConfigKey(keySel.Text())
 		if key == "" {
 			return
 		}
 		valSel := sel.Find(".cfg-val").First()
-		val := strings.TrimSpace(valSel.Text())
-		if key == "end" {
-			if iso := strings.TrimSpace(valSel.Find(".tip-text").First().Text()); iso != "" {
-				config["end_iso"] = iso
+		visibleVal := valSel.Clone()
+		visibleVal.Find(".tip-text, [role=tooltip]").Remove()
+		val := strings.TrimSpace(visibleVal.Text())
+		if key == "start" || key == "deadline" || key == "end" {
+			iso := strings.TrimSpace(valSel.Find(".tip-text").First().Text())
+			if iso == "" {
+				iso, _ = valSel.Find("[data-title]").First().Attr("data-title")
+			}
+			if iso == "" {
+				iso, _ = valSel.Find("time[datetime]").First().Attr("datetime")
+			}
+			if iso != "" {
+				config[key+"_iso"] = strings.TrimSpace(iso)
 			}
 			if val != "" {
-				config["end_display"] = val
+				config[key+"_display"] = val
 			}
 			return
 		}
@@ -792,6 +810,9 @@ func normalizeConfigKey(raw string) string {
 }
 
 func shouldIgnoreAssetURL(raw string) bool {
+	if state.IsSiteInfoURL(raw) {
+		return true
+	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return true

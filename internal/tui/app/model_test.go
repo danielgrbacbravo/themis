@@ -127,7 +127,7 @@ func TestRefreshKeyFlowAndJumpProjectRoot(t *testing.T) {
 	if cmd == nil {
 		t.Fatalf("expected refresh command")
 	}
-	msg := cmd()
+	msg := workMessage(cmd)
 	updated, _ = m.Update(msg)
 	m = updated.(Model)
 	if !executorCalled {
@@ -160,7 +160,7 @@ func TestRefreshFailureStatus(t *testing.T) {
 	if cmd == nil {
 		t.Fatalf("expected refresh command")
 	}
-	msg := cmd()
+	msg := workMessage(cmd)
 	updated, _ = m.Update(msg)
 	m = updated.(Model)
 	if m.statusText == "" || m.statusText == "Cached view (refresh actions enabled)" {
@@ -214,7 +214,7 @@ func TestDownloadFlow(t *testing.T) {
 	}
 
 	for cmd != nil {
-		msg := cmd()
+		msg := workMessage(cmd)
 		updated, next := m.Update(msg)
 		m = updated.(Model)
 		cmd = next
@@ -255,7 +255,7 @@ func TestDownloadViewportKeepsHeaderAndCursorVisible(t *testing.T) {
 	if !strings.Contains(view, "Download") {
 		t.Fatalf("expected download header visible")
 	}
-	if !strings.Contains(view, "> [x] 40.in") {
+	if !strings.Contains(view, "> [x] ⇥  40.in") {
 		t.Fatalf("expected cursor line for last item visible")
 	}
 }
@@ -297,20 +297,21 @@ func TestRenderDetails_ShowsStatsSummary(t *testing.T) {
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = updated.(Model)
 
-	view := m.renderDetailsForSize(120, 40)
+	m.showSource = true
+	view := m.renderDetails(120, 0)
 	assertContains := func(needle string) {
 		if !strings.Contains(view, needle) {
 			t.Fatalf("expected details view to contain %q\nview:\n%s", needle, view)
 		}
 	}
 
-	assertContains("Stats:")
-	assertContains("- Page: https://themis.housing.rug.nl/stats/2025-2026/os/lab1")
-	assertContains("- Status: passed")
-	assertContains("- Grade: 20.00")
-	assertContains("- Group: D. Grbac Bravo")
-	assertContains("- Counts: total=8, passed=1")
-	assertContains("- Leading: Exercise 1 / s5482585-7")
+	assertContains("SUBMISSION")
+	assertContains("https://themis.housing.rug.nl/stats/2025-2026/os/lab1")
+	assertContains("Passed")
+	assertContains("20.00")
+	assertContains("D. Grbac Bravo")
+	assertContains("1 / 8 passed")
+	assertContains("Exercise 1 / s5482585-7")
 }
 
 func TestRenderDetails_ShowsStatsLoadHintWhenOnlyStatusPageExists(t *testing.T) {
@@ -331,12 +332,13 @@ func TestRenderDetails_ShowsStatsLoadHintWhenOnlyStatusPageExists(t *testing.T) 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = updated.(Model)
 
-	view := m.renderDetailsForSize(120, 30)
-	if !strings.Contains(view, "Status page: https://themis.housing.rug.nl/stats/2025-2026/os/lab1") {
+	m.showSource = true
+	view := m.renderDetails(120, 0)
+	if !strings.Contains(view, "Status page  https://themis.housing.rug.nl/stats/2025-2026/os/lab1") {
 		t.Fatalf("expected status page in details view\nview:\n%s", view)
 	}
-	if !strings.Contains(view, "Stats: not loaded yet (refresh this node)") {
-		t.Fatalf("expected stats load hint in details view\nview:\n%s", view)
+	if strings.Contains(view, "SUBMISSION") {
+		t.Fatalf("unexpected empty submission section in details view\nview:\n%s", view)
 	}
 }
 
@@ -403,9 +405,149 @@ func TestRenderTree_AssignmentResultLabelsAndFreshnessIndicator(t *testing.T) {
 			t.Fatalf("expected tree to contain %q\ntree:\n%s", needle, tree)
 		}
 	}
-	assertContains("[passed] Lab 1")
-	assertContains("[failing] Lab 2")
-	assertContains("(stale)")
-	assertContains("[not_submitted] Lab 3")
-	assertContains("[17.50] Lab 4")
+	assertContains("✓ Lab 1")
+	assertContains("× Lab 2")
+	if strings.Contains(tree, "(stale)") {
+		t.Fatal("tree contains verbose cache tag")
+	}
+	assertContains("· Lab 3")
+	assertContains("◇ Lab 4")
+}
+
+func TestRenderCourseSummarySeparateFromAssignmentStats(t *testing.T) {
+	now := time.Date(2026, 3, 18, 12, 0, 0, 0, time.UTC)
+	m, err := NewModel(Config{State: baseStateForTUI(now)})
+	if err != nil {
+		t.Fatalf("new model failed: %v", err)
+	}
+	m.courseSummary = state.CourseSummary{
+		TotalAssignments:     3,
+		SubmittedAssignments: 1,
+		PassedAssignments:    1,
+		CompletionPercent:    33,
+		UpcomingDeadlines: []state.DeadlineGroup{
+			{
+				DaysUntil: 4,
+				Assignments: []state.AssignmentDeadline{
+					{NodeID: "url:lab1", Title: "Lab 1", Submitted: true, Passed: true},
+					{NodeID: "url:lab2", Title: "Lab 2"},
+					{NodeID: "url:lab3", Title: "Lab 3"},
+				},
+			},
+		},
+	}
+
+	view := m.renderCourseSummary(120, 5)
+	assertContains := func(needle string) {
+		if !strings.Contains(view, needle) {
+			t.Fatalf("expected course summary to contain %q\nview:\n%s", needle, view)
+		}
+	}
+	assertContains("Course Summary")
+	assertContains("Submitted 1/3 (33%), passed 1")
+	assertContains("4 days until deadline for these 3: Lab 1, Lab 2, Lab 3")
+	if strings.Contains(view, "Stats:") {
+		t.Fatalf("course summary should not render per-assignment stats label\nview:\n%s", view)
+	}
+}
+
+func TestDownloadExcludesCachedSiteInfoAndRecentChoices(t *testing.T) {
+	st := baseStateForTUI(time.Now())
+	node := st.Nodes["url:root"]
+	node.Assets = append(node.Assets,
+		state.AssetRef{Name: "About Themis", URL: "https://themis.housing.rug.nl/about", Kind: "asset"},
+		state.AssetRef{Name: "Privacy Policy", URL: "https://www.rug.nl/info/privacy", Kind: "asset"},
+	)
+	st.Nodes[node.ID] = node
+	m, err := NewModel(Config{State: st, RecentAssetChoices: map[string][]string{node.ID: {node.Assets[0].URL, node.Assets[2].URL, node.Assets[3].URL}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(m.renderDetailsForSize(100, 30), "FILES · 2") {
+		t.Fatal("file count includes site info")
+	}
+	m, _ = sendKey(m, "d")
+	view := m.renderDetailsForSize(100, 30)
+	if strings.Contains(view, "About Themis") || strings.Contains(view, "Privacy Policy") {
+		t.Fatalf("site info visible in picker: %s", view)
+	}
+	if got := m.selectedAssetURLs(); len(got) != 1 || got[0] != node.Assets[0].URL {
+		t.Fatalf("cached choices included site info: %v", got)
+	}
+	m, _ = sendKey(m, "a")
+	if len(m.selectedAssets()) != 2 {
+		t.Fatal("select all included site info")
+	}
+}
+
+func TestCourseSummaryKeepsUpcomingDeadlineVisibleAlongsideOverdue(t *testing.T) {
+	m, err := NewModel(Config{State: baseStateForTUI(time.Now())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.courseSummary = state.CourseSummary{TotalAssignments: 11, SubmittedAssignments: 4, PassedAssignments: 4, CompletionPercent: 36,
+		OverdueAssignments: []state.AssignmentDeadline{{Title: "Lab 1"}},
+		UpcomingDeadlines:  []state.DeadlineGroup{{DaysUntil: 3, Assignments: []state.AssignmentDeadline{{Title: "Lab 2"}}}},
+	}
+	view := m.renderCourseSummary(78, 3)
+	if !strings.Contains(view, "3 days until deadline") || !strings.Contains(view, "1 overdue") {
+		t.Fatalf("upcoming or overdue deadline missing: %s", view)
+	}
+}
+
+func TestConfigurationDistinguishesDeadlineFromSubmissionCutoff(t *testing.T) {
+	details := map[string]any{"config": map[string]any{
+		"deadline:_you_can_still_submit.": "Thu Sep 17 2026 09:00:00 GMT+0200\n2026-09-17T07:00:00.000Z",
+		"end:_you_can_no_longer_submit.":  "Fri Sep 18 2026 09:00:00 GMT+0200\n2026-09-18T07:00:00.000Z",
+	}}
+	view := strings.Join(configSummaryLines(details), "\n")
+	if !strings.Contains(view, "Deadline: Thu Sep 17") || !strings.Contains(view, "Submissions close: Fri Sep 18") {
+		t.Fatalf("date labels missing: %s", view)
+	}
+	if strings.Contains(view, ".000Z") {
+		t.Fatal("hidden tooltip duplicated in date display")
+	}
+}
+
+func TestParentCompletionMatchesTreeDetailsAndSummary(t *testing.T) {
+	st := baseStateForTUI(time.Now())
+	root := st.Nodes["url:root"]
+	root.Kind = "assignment"
+	root.Details = map[string]any{"stats": map[string]any{"summary": map[string]any{"status": "not_submitted"}}}
+	st.Nodes[root.ID] = root
+	for _, id := range root.ChildIDs {
+		node := st.Nodes[id]
+		node.Details = map[string]any{"stats": map[string]any{"summary": map[string]any{"status": "passed"}}}
+		st.Nodes[id] = node
+	}
+	m, err := NewModel(Config{State: st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.courseSummary.TotalAssignments != 2 || m.courseSummary.PassedAssignments != 2 {
+		t.Fatalf("wrong leaf totals: %+v", m.courseSummary)
+	}
+	if !strings.Contains(m.renderTree(), "▾ ✓ Operating Systems") {
+		t.Fatalf("parent completion absent from tree: %s", m.renderTree())
+	}
+	details := m.renderDetails(80, 0)
+	if !strings.Contains(details, "Completed · all subtasks passed") || !strings.Contains(details, "2 / 2 passed") {
+		t.Fatalf("parent details disagree: %s", details)
+	}
+	m, _ = sendKey(m, "h")
+	if !strings.Contains(m.renderTree(), "▸ ✓ Operating Systems") {
+		t.Fatal("collapsing children hid derived completion")
+	}
+	// Refreshing a child's result must also update its ancestors.
+	leaf := st.Nodes["url:lab2"]
+	leaf.Details = map[string]any{"stats": map[string]any{"summary": map[string]any{"status": "failed"}}}
+	st.Nodes[leaf.ID] = leaf
+	updated, _ := m.Update(refreshFinishedMsg{Outcome: RefreshOutcome{State: st, TargetNodeID: leaf.ID}})
+	m = updated.(Model)
+	if strings.Contains(m.renderTree(), "✓ Operating Systems") || strings.Contains(m.renderDetails(80, 0), "Completed ·") {
+		t.Fatal("parent stayed complete after subtask failed")
+	}
+	if !strings.Contains(m.renderDetails(80, 0), "1 / 2 passed") {
+		t.Fatal("parent progress excluded an extra task")
+	}
 }

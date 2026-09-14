@@ -168,3 +168,26 @@ func notFoundResponse(req *http.Request) *http.Response {
 		Request:    req,
 	}
 }
+
+func TestDownloadAssetRefsSkipsSiteInfoFromOldCaches(t *testing.T) {
+	assets := []state.AssetRef{
+		{Name: "About Themis", URL: "https://themis.housing.rug.nl/about", Kind: "asset"},
+		{Name: "Privacy Policy", URL: "https://www.rug.nl/info/privacy", Kind: "asset"},
+		{Name: "Privacy Policy", URL: "https://themis.housing.rug.nl/file/course/privacy.pdf", Kind: "file"},
+	}
+	hits := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		hits++
+		if req.URL.Path != "/file/course/privacy.pdf" {
+			t.Fatalf("requested site info: %s", req.URL)
+		}
+		return okResponse(req, "assignment document"), nil
+	})}
+	downloaded, err := DownloadAssetRefs(client, assets, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits != 1 || len(downloaded) != 1 {
+		t.Fatalf("expected only assignment file, got %d requests and %d files", hits, len(downloaded))
+	}
+}

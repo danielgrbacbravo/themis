@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"themis-cli/internal/discovery"
+	"themis-cli/internal/filepreview"
 	"themis-cli/internal/projectlink"
 	"themis-cli/internal/state"
 	"themis-cli/internal/themis"
@@ -19,6 +22,7 @@ import (
 )
 
 const defaultBaseURL = "https://themis.housing.rug.nl"
+const defaultProjectRefreshDepth = 8
 
 type commonFlags struct {
 	baseURL     string
@@ -490,8 +494,44 @@ func runProject(args []string) {
 	switch args[0] {
 	case "link":
 		runProjectLink(args[1:])
+	case "refresh":
+		runProjectRefresh(args[1:])
 	default:
 		fail(fmt.Errorf("unknown project subcommand: %s", args[0]), wantsJSON(args[1:]), "")
+	}
+}
+
+func runProjectRefresh(args []string) {
+	jsonRequested := wantsJSON(args)
+	fs := newFlagSet("project refresh")
+	common := addCommonFlags(fs)
+	depth := fs.Int("depth", defaultProjectRefreshDepth, "Depth for refreshing the linked project")
+	if err := fs.Parse(args); err != nil {
+		fail(err, jsonRequested, "")
+	}
+	if *depth < 0 {
+		fail(fmt.Errorf("--depth must be >= 0"), common.jsonOutput, "")
+	}
+
+	result, err := refreshLinkedProject(*common, *depth, !common.jsonOutput)
+	if err != nil {
+		fail(err, common.jsonOutput, common.baseURL)
+	}
+	if common.jsonOutput {
+		writeJSON(map[string]any{
+			"status":         "ok",
+			"base_url":       result.BaseURL,
+			"root_url":       result.RootURL,
+			"root_node_id":   result.RootNodeID,
+			"depth":          result.Depth,
+			"fetched_nodes":  result.FetchedNodes,
+			"updated_nodes":  result.UpdatedNodes,
+			"removed_edges":  result.RemovedEdges,
+			"warnings":       result.Warnings,
+			"state_path":     result.StatePath,
+			"project_config": result.ProjectConfig,
+			"duration_ms":    result.DurationMs,
+		})
 	}
 }
 
@@ -561,6 +601,120 @@ func runProjectLink(args []string) {
 
 	fmt.Printf("Linked %s to %s\n", repoRoot, canonicalRootURL)
 	fmt.Printf("Saved project config at %s\n", cfgPath)
+}
+
+type projectRefreshResult struct {
+	BaseURL       string
+	RootURL       string
+	RootNodeID    string
+	Depth         int
+	FetchedNodes  int
+	UpdatedNodes  int
+	RemovedEdges  int
+	Warnings      []string
+	StatePath     string
+	ProjectConfig string
+	DurationMs    int64
+}
+
+func refreshLinkedProject(common commonFlags, depth int, showProgress bool) (projectRefreshResult, error) {
+	start := time.Now()
+	cfg, cfgPath, err := projectlink.ResolveByCWD(".")
+	if err != nil {
+		if errors.Is(err, projectlink.ErrNotLinked) {
+			return projectRefreshResult{}, fmt.Errorf("project is not linked; run `themis project link --root-url <url>`")
+		}
+		return projectRefreshResult{}, err
+	}
+	if strings.TrimSpace(cfg.LinkedRootURL) == "" {
+		return projectRefreshResult{}, fmt.Errorf("linked project has no linked_root_url")
+	}
+
+	baseURL, err := themis.NormalizeBaseURL(common.baseURL)
+	if err != nil {
+		return projectRefreshResult{}, err
+	}
+	statePath, err := state.DefaultStatePath()
+	if err != nil {
+		return projectRefreshResult{}, err
+	}
+	st, err := state.Load(statePath)
+	if err != nil {
+		return projectRefreshResult{}, err
+	}
+	if st.BaseURL == "" {
+		st.BaseURL = baseURL
+	}
+	if st.CatalogRootURL == "" {
+		st.CatalogRootURL = strings.TrimRight(baseURL, "/") + "/course"
+	}
+
+	rootURL, err := state.CanonicalizeURL(cfg.LinkedRootURL)
+	if err != nil {
+		return projectRefreshResult{}, err
+	}
+	rootNodeID := strings.TrimSpace(cfg.LinkedRootNodeID)
+	if rootNodeID == "" {
+		rootNodeID = state.NodeIDFromCanonicalURL(rootURL)
+	}
+
+	if showProgress {
+		fmt.Fprintf(os.Stderr, "Refreshing linked project:\n  %s\n", rootURL)
+		fmt.Fprintf(os.Stderr, "Loading session and validating authentication...\n")
+	}
+	session, err := themis.NewSessionWithAuthConfig(baseURL, themis.AuthConfig{
+		SessionFile: common.sessionFile,
+	})
+	if err != nil {
+		return projectRefreshResult{}, err
+	}
+	if _, err := session.ValidateAuthentication(); err != nil {
+		return projectRefreshResult{}, err
+	}
+
+	if showProgress {
+		fmt.Fprintf(os.Stderr, "Fetching project tree to depth %d...\n", depth)
+	}
+	service := discovery.NewService(session.BaseURL)
+	if showProgress {
+		service.Progress = func(progress discovery.RefreshProgress) {
+			title := strings.TrimSpace(progress.Title)
+			if title == "" {
+				title = progress.URL
+			}
+			fmt.Fprintf(os.Stderr, "  [%d] %s\n", progress.FetchedNodes, title)
+		}
+	}
+	refreshResult, err := service.RefreshNode(session.Client, &st, rootURL, depth)
+	if err != nil {
+		return projectRefreshResult{}, err
+	}
+	if upsertRootRef(&st, rootNodeID, rootURL) && showProgress {
+		fmt.Fprintf(os.Stderr, "Updated linked root metadata.\n")
+	}
+	if showProgress {
+		fmt.Fprintf(os.Stderr, "Saving state...\n")
+	}
+	if err := state.SaveAtomic(statePath, st, true); err != nil {
+		return projectRefreshResult{}, err
+	}
+	if showProgress {
+		fmt.Fprintf(os.Stderr, "Done. Fetched %d node(s), updated %d node(s).\n", refreshResult.FetchedNodes, refreshResult.UpdatedNodes)
+	}
+
+	return projectRefreshResult{
+		BaseURL:       baseURL,
+		RootURL:       rootURL,
+		RootNodeID:    rootNodeID,
+		Depth:         depth,
+		FetchedNodes:  refreshResult.FetchedNodes,
+		UpdatedNodes:  refreshResult.UpdatedNodes,
+		RemovedEdges:  refreshResult.RemovedEdges,
+		Warnings:      refreshResult.Errors,
+		StatePath:     statePath,
+		ProjectConfig: cfgPath,
+		DurationMs:    time.Since(start).Milliseconds(),
+	}, nil
 }
 
 type loginInputs struct {
@@ -791,6 +945,8 @@ func runAppTUI(args []string) {
 	fs := newFlagSet("themis")
 	common := addCommonFlags(fs)
 	rootURL := fs.String("root-url", "", "Optional root URL to focus in TUI")
+	autoRefresh := fs.Bool("auto-refresh-on-open", true, "Refresh the displayed course in the background on launch")
+	reducedMotion := fs.Bool("reduced-motion", os.Getenv("THEMIS_REDUCED_MOTION") == "1", "Use static activity indicators")
 	if err := fs.Parse(args); err != nil {
 		fail(err, jsonRequested, "")
 	}
@@ -811,7 +967,8 @@ func runAppTUI(args []string) {
 	}
 
 	rootNodeID := ""
-	if strings.TrimSpace(*rootURL) != "" {
+	explicitRootRequested := strings.TrimSpace(*rootURL) != ""
+	if explicitRootRequested {
 		id, _, err := state.NodeIDFromURL(strings.TrimSpace(*rootURL))
 		if err != nil {
 			fail(err, false, "")
@@ -829,7 +986,29 @@ func runAppTUI(args []string) {
 		if projectRootID == "" {
 			projectRootID = state.NodeIDFromCanonicalURL(cfg.LinkedRootURL)
 		}
-		if rootNodeID == "" {
+		if !explicitRootRequested {
+			if _, ok := st.Nodes[projectRootID]; !ok {
+				fmt.Fprintf(os.Stderr, "Linked project root is missing from local state:\n  %s\n", cfg.LinkedRootURL)
+				refresh, err := promptYesNo("Refresh it now?", true)
+				if err != nil {
+					fail(err, false, common.baseURL)
+				}
+				if refresh {
+					result, err := refreshLinkedProject(*common, defaultProjectRefreshDepth, true)
+					if err != nil {
+						fail(err, false, common.baseURL)
+					}
+					st, err = state.Load(statePath)
+					if err != nil {
+						fail(err, false, "")
+					}
+					projectRootID = result.RootNodeID
+				} else {
+					fmt.Fprintf(os.Stderr, "Opening cached catalog instead. Run `themis project refresh` later to repair this project link.\n")
+				}
+			}
+		}
+		if shouldUseLinkedRootAsTUIRoot(st, rootNodeID, projectRootID) {
 			rootNodeID = projectRootID
 		}
 		linkedRootNodeID = projectRootID
@@ -956,18 +1135,67 @@ func runAppTUI(args []string) {
 		return out
 	}
 
+	previewExec := func(ctx context.Context, asset state.AssetRef) (filepreview.Content, error) {
+		session, err := themis.LoadSessionWithAuthConfig(common.baseURL, themis.AuthConfig{SessionFile: common.sessionFile})
+		if err != nil {
+			return filepreview.Content{}, err
+		}
+		return discovery.PreviewAsset(ctx, session.Client, asset)
+	}
+
 	if err := tuiapp.Run(tuiapp.Config{
 		State:               st,
+		DisableAutoRefresh:  !*autoRefresh,
+		ReducedMotion:       *reducedMotion,
 		RootNodeID:          rootNodeID,
 		LinkedRootNodeID:    linkedRootNodeID,
 		SubtreeRefreshDepth: subtreeRefreshDepth,
 		RefreshExecutor:     refreshExec,
 		DownloadExecutor:    downloadExec,
+		PreviewExecutor:     previewExec,
 		DefaultDownloadDir:  downloadDir,
 		RecentAssetChoices:  recentChoices,
 		PersistChoices:      persistChoices,
 	}); err != nil {
 		fail(err, false, "")
+	}
+}
+
+func shouldUseLinkedRootAsTUIRoot(st state.State, requestedRootNodeID string, linkedRootNodeID string) bool {
+	if strings.TrimSpace(requestedRootNodeID) != "" {
+		return false
+	}
+	linkedRootNodeID = strings.TrimSpace(linkedRootNodeID)
+	if linkedRootNodeID == "" {
+		return false
+	}
+	_, ok := st.Nodes[linkedRootNodeID]
+	return ok
+}
+
+func promptYesNo(question string, defaultYes bool) (bool, error) {
+	suffix := " [y/N] "
+	if defaultYes {
+		suffix = " [Y/n] "
+	}
+	fmt.Fprint(os.Stderr, question+suffix)
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer == "" {
+		return defaultYes, nil
+	}
+	switch answer {
+	case "y", "yes":
+		return true, nil
+	case "n", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("expected yes or no")
 	}
 }
 
@@ -1042,7 +1270,8 @@ func printUsage() {
 	fmt.Println("  login [--username <value>] [--password <value>] [--totp <value>]")
 	fmt.Println("  auth [--username <value>] [--password <value>] [--save-username=<bool>] [--save-password=<bool>] [--clear-username] [--clear-password]")
 	fmt.Println("  project link --root-url <url> [--default-refresh-depth <n>]")
-	fmt.Println("  themis [--root-url <url>]")
+	fmt.Println("  project refresh [--depth <n>]")
+	fmt.Println("  themis [--root-url <url>] [--auto-refresh-on-open=false] [--reduced-motion]")
 }
 
 func fail(err error, asJSON bool, baseURL string) {

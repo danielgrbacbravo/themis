@@ -2,6 +2,10 @@ package login
 
 import (
 	"errors"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+	"strings"
 	"testing"
 )
 
@@ -104,5 +108,69 @@ func TestStartSubmit_SuccessAndFailureMessages(t *testing.T) {
 	}
 	if afterSuccess.statusLine == "" {
 		t.Fatalf("expected success status line")
+	}
+}
+
+func TestLoginResizeKeepsFocusedFieldVisible(t *testing.T) {
+	m := newModel(Prefill{Username: strings.Repeat("student", 30), Password: strings.Repeat("secret", 30)}, nil)
+	for _, size := range [][2]int{{0, 0}, {1, 1}, {23, 7}, {24, 8}, {40, 10}, {80, 24}, {24, 8}} {
+		updated, _ := m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		m = updated.(model)
+		for i := 0; i < 6; i++ {
+			view := m.View()
+			if size[0] <= 0 || size[1] <= 0 {
+				if view != "" {
+					t.Fatal("rendered before terminal size")
+				}
+			} else if lipgloss.Width(view) > size[0] || lipgloss.Height(view) > size[1] {
+				t.Fatalf("login overflow at %v: %s", size, view)
+			}
+			if size[0] >= 24 && size[1] >= 8 {
+				label := []string{"Username", "Password", "TOTP", "Save username", "Save password", "Submit"}[m.focusIndex]
+				if !strings.Contains(view, label) {
+					t.Fatalf("focused %s hidden at %v", label, size)
+				}
+				if strings.Contains(view, "secret") {
+					t.Fatal("password leaked into view")
+				}
+			}
+			m.moveFocus("tab")
+		}
+	}
+	if m.usernameInput.Value() != strings.Repeat("student", 30) {
+		t.Fatal("resizing modified username")
+	}
+}
+
+func TestLoginCanResizeAndCancelWhileSubmitting(t *testing.T) {
+	m := newModel(Prefill{}, nil)
+	m.submitting = true
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 30, Height: 8})
+	m = updated.(model)
+	if m.width != 30 || m.height != 8 {
+		t.Fatal("ignored resize while submitting")
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil || !updated.(model).canceled {
+		t.Fatal("cannot cancel pending login")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("cancel did not quit")
+	}
+}
+
+func TestLoginPlaceholdersUseTerminalPalette(t *testing.T) {
+	profile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(profile)
+	m := newModel(Prefill{}, nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = updated.(model)
+	view := m.View()
+	if strings.Contains(view, "38;") || strings.Contains(view, "48;") {
+		t.Fatalf("login emitted fixed colors: %q", view)
+	}
+	if !strings.Contains(view, "\x1b[90m") {
+		t.Fatal("placeholder is not using the terminal muted color")
 	}
 }

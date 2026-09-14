@@ -59,3 +59,30 @@ type AssetRef struct {
 	SHA256    string `json:"sha256,omitempty"`
 	SizeBytes int64  `json:"size_bytes,omitempty"`
 }
+
+type CourseSummary struct {
+	RootNodeID           string
+	TotalAssignments     int
+	SubmittedAssignments int
+	PassedAssignments    int
+	CompletionPercent    int
+	UpcomingDeadlines    []DeadlineGroup
+	OverdueAssignments   []AssignmentDeadline
+}
+
+type DeadlineGroup struct {
+	DaysUntil   int
+	DueDate     string
+	Assignments []AssignmentDeadline
+}
+
+type AssignmentDeadline struct {
+	NodeID     string
+	Title      string
+	URL        string
+	DueAt      time.Time
+	DueDisplay string
+	Status     string
+	Submitted  bool
+	Passed     bool
+}
