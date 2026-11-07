@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"themis-cli/internal/browserprefs"
 	"themis-cli/internal/discovery"
 	"themis-cli/internal/filepreview"
 	"themis-cli/internal/projectlink"
@@ -18,6 +19,7 @@ import (
 	"themis-cli/internal/themis"
 	tuiapp "themis-cli/internal/tui/app"
 	loginui "themis-cli/internal/tui/login"
+	"themis-cli/internal/workspace"
 	"time"
 )
 
@@ -56,6 +58,10 @@ func main() {
 	}
 
 	switch args[0] {
+	case "submit":
+		os.Exit(runSubmit(args[1:]))
+	case "status":
+		os.Exit(runSubmissionStatus(args[1:]))
 	case "check":
 		runCheck(args[1:])
 	case "list":
@@ -539,7 +545,7 @@ func runProjectLink(args []string) {
 	jsonRequested := wantsJSON(args)
 	fs := newFlagSet("project link")
 	common := addCommonFlags(fs)
-	rootURL := fs.String("root-url", "", "Course root URL to link to current repository")
+	rootURL := fs.String("root-url", "", "Course or assignment URL to link to the current directory")
 	lastOpenNodeID := fs.String("last-open-node-id", "", "Optional last opened node id")
 	defaultRefreshDepth := fs.Int("default-refresh-depth", 1, "Default refresh depth for linked project")
 	autoRefreshOnOpen := fs.Bool("auto-refresh-on-open", false, "Auto refresh when opening TUI in this project")
@@ -558,13 +564,16 @@ func runProjectLink(args []string) {
 		fail(fmt.Errorf("--show-stale-warning-after-minutes must be >= 1"), common.jsonOutput, "")
 	}
 
-	repoRoot, err := findRepoRoot(".")
+	repoRoot, err := filepath.Abs(".")
 	if err != nil {
 		fail(err, common.jsonOutput, "")
 	}
 
 	canonicalRootURL, err := state.CanonicalizeURL(*rootURL)
 	if err != nil {
+		fail(err, common.jsonOutput, common.baseURL)
+	}
+	if err := projectlink.ValidateTarget(common.baseURL, canonicalRootURL); err != nil {
 		fail(err, common.jsonOutput, common.baseURL)
 	}
 	rootNodeID := state.NodeIDFromCanonicalURL(canonicalRootURL)
@@ -582,6 +591,13 @@ func runProjectLink(args []string) {
 	}
 
 	cfgPath := projectlink.ConfigPathFromRepoRoot(repoRoot)
+	if previous, err := projectlink.Load(cfgPath); err == nil {
+		cfg.LastDownloadDir = previous.LastDownloadDir
+		cfg.DownloadDirs = previous.DownloadDirs
+		cfg.RecentAssetChoices = previous.RecentAssetChoices
+	} else if !os.IsNotExist(err) {
+		fail(err, common.jsonOutput, common.baseURL)
+	}
 	if err := projectlink.Save(cfgPath, cfg); err != nil {
 		fail(err, common.jsonOutput, common.baseURL)
 	}
@@ -976,64 +992,103 @@ func runAppTUI(args []string) {
 		rootNodeID = id
 	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		fail(err, false, common.baseURL)
+	}
+	linkService := projectlink.Service{WorkingDir: cwd, BaseURL: common.baseURL}
+	projectContext, err := linkService.Resolve()
+	if err != nil {
+		fail(err, false, common.baseURL)
+	}
+	st.BaseURL = common.baseURL
+	st.CatalogRootURL = strings.TrimRight(common.baseURL, "/") + "/course"
+	if st.Nodes == nil {
+		st.Nodes = map[string]state.Node{}
+	}
+	seed := func(raw, title, kind string) string {
+		id, canonical, err := state.NodeIDFromURL(raw)
+		if err != nil {
+			fail(err, false, common.baseURL)
+		}
+		if _, exists := st.Nodes[id]; !exists {
+			tail := strings.TrimPrefix(canonical, strings.TrimRight(common.baseURL, "/")+"/course")
+			switch len(strings.Split(strings.Trim(tail, "/"), "/")) {
+			case 1:
+				if strings.Trim(tail, "/") == "" {
+					kind = "catalog"
+				} else {
+					kind = "year"
+				}
+			case 2:
+				kind = "course"
+			}
+			st.Nodes[id] = state.Node{ID: id, CanonicalURL: canonical, Title: title, Kind: kind, Status: state.StatusNever}
+		}
+		return id
+	}
+	catalogID := seed(st.CatalogRootURL, "Courses", "catalog")
 	linkedRootNodeID := ""
 	subtreeRefreshDepth := 1
-	downloadDir := "."
+	downloadDir := cwd
 	recentChoices := map[string][]string{}
-	var persistChoices tuiapp.PersistChoicesFunc
-	if cfg, cfgPath, err := projectlink.ResolveByCWD("."); err == nil {
-		projectRootID := strings.TrimSpace(cfg.LinkedRootNodeID)
-		if projectRootID == "" {
-			projectRootID = state.NodeIDFromCanonicalURL(cfg.LinkedRootURL)
-		}
+	if projectContext.ConfigPath != "" {
+		cfg := projectContext.Config
+		linkedRootNodeID = seed(cfg.LinkedRootURL, cfg.LinkedRootURL, "assignment")
 		if !explicitRootRequested {
-			if _, ok := st.Nodes[projectRootID]; !ok {
-				fmt.Fprintf(os.Stderr, "Linked project root is missing from local state:\n  %s\n", cfg.LinkedRootURL)
-				refresh, err := promptYesNo("Refresh it now?", true)
-				if err != nil {
-					fail(err, false, common.baseURL)
-				}
-				if refresh {
-					result, err := refreshLinkedProject(*common, defaultProjectRefreshDepth, true)
-					if err != nil {
-						fail(err, false, common.baseURL)
-					}
-					st, err = state.Load(statePath)
-					if err != nil {
-						fail(err, false, "")
-					}
-					projectRootID = result.RootNodeID
-				} else {
-					fmt.Fprintf(os.Stderr, "Opening cached catalog instead. Run `themis project refresh` later to repair this project link.\n")
-				}
-			}
+			rootNodeID = linkedRootNodeID
 		}
-		if shouldUseLinkedRootAsTUIRoot(st, rootNodeID, projectRootID) {
-			rootNodeID = projectRootID
-		}
-		linkedRootNodeID = projectRootID
-		if cfg.Preferences.DefaultRefreshDepth > 0 {
-			subtreeRefreshDepth = cfg.Preferences.DefaultRefreshDepth
-		}
-		if strings.TrimSpace(cfg.LastDownloadDir) != "" {
+		subtreeRefreshDepth = cfg.Preferences.DefaultRefreshDepth
+		if cfg.LastDownloadDir != "" {
 			downloadDir = cfg.LastDownloadDir
-		}
-		for nodeID, urls := range cfg.RecentAssetChoices {
-			recentChoices[nodeID] = append([]string(nil), urls...)
-		}
-		persistChoices = func(nodeID string, assetURLs []string, targetDir string) error {
-			latest, err := projectlink.Load(cfgPath)
-			if err != nil {
-				return err
+			if !filepath.IsAbs(downloadDir) {
+				downloadDir = filepath.Join(cwd, downloadDir)
 			}
-			if latest.RecentAssetChoices == nil {
-				latest.RecentAssetChoices = map[string][]string{}
-			}
-			latest.RecentAssetChoices[nodeID] = append([]string(nil), assetURLs...)
-			latest.LastDownloadDir = targetDir
-			return projectlink.Save(cfgPath, latest)
 		}
+		recentChoices = cfg.RecentAssetChoices
 	}
+	if explicitRootRequested {
+		if err := projectlink.ValidateTarget(common.baseURL, *rootURL); err != nil {
+			fail(err, false, common.baseURL)
+		}
+		rootNodeID = seed(*rootURL, *rootURL, "assignment")
+	}
+	if rootNodeID == "" {
+		rootNodeID = catalogID
+	}
+	persistChoices := func(nodeID string, assetURLs []string, targetDir string) error {
+		ctx, err := linkService.Resolve()
+		if err != nil {
+			return err
+		}
+		if ctx.ConfigPath == "" {
+			return nil
+		}
+		cfg := ctx.Config
+		if cfg.RecentAssetChoices == nil {
+			cfg.RecentAssetChoices = map[string][]string{}
+		}
+		cfg.RecentAssetChoices[nodeID] = append([]string(nil), assetURLs...)
+		cfg.LastDownloadDir = targetDir
+		if cfg.DownloadDirs == nil {
+			cfg.DownloadDirs = map[string]string{}
+		}
+		physicalRoot, err := filepath.EvalSymlinks(ctx.LinkDir)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(physicalRoot, targetDir)
+		if err != nil {
+			return err
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("download directory is outside the linked project")
+		}
+		cfg.DownloadDirs[nodeID] = rel
+		return projectlink.Save(ctx.ConfigPath, cfg)
+	}
+	browserPath := filepath.Join(filepath.Dir(statePath), "browser.json")
+	browserPreferences, browserErr := browserprefs.Load(browserPath)
 
 	refreshExec := func(current state.State, req tuiapp.RefreshRequest) tuiapp.RefreshOutcome {
 		start := time.Now()
@@ -1116,7 +1171,26 @@ func runAppTUI(args []string) {
 			return out
 		}
 
-		items, err := discovery.DownloadAssetRefs(session.Client, req.Assets, req.TargetDir)
+		var items []discovery.DownloadedAsset
+		if req.RelativePath != "" && len(req.Assets) == 1 {
+			service := workspace.Service{}
+			files, checkErr := service.Review(req.Root, req.TargetDir, []string{req.RelativePath})
+			if checkErr != nil {
+				out.Err = checkErr
+				return out
+			}
+			if files[0].Exists && !req.Overwrite {
+				out.Err = fmt.Errorf("a file appeared at the reviewed destination; choose the destination again")
+				return out
+			}
+			var item discovery.DownloadedAsset
+			item, err = discovery.DownloadAssetToPath(session.Client, req.Assets[0], files[0].Path, req.Overwrite)
+			if err == nil {
+				items = []discovery.DownloadedAsset{item}
+			}
+		} else {
+			items, err = discovery.DownloadAssetRefs(session.Client, req.Assets, req.TargetDir)
+		}
 		out.DurationMs = time.Since(start).Milliseconds()
 		if err != nil {
 			out.Err = err
@@ -1144,18 +1218,26 @@ func runAppTUI(args []string) {
 	}
 
 	if err := tuiapp.Run(tuiapp.Config{
-		State:               st,
-		DisableAutoRefresh:  !*autoRefresh,
-		ReducedMotion:       *reducedMotion,
-		RootNodeID:          rootNodeID,
-		LinkedRootNodeID:    linkedRootNodeID,
-		SubtreeRefreshDepth: subtreeRefreshDepth,
-		RefreshExecutor:     refreshExec,
-		DownloadExecutor:    downloadExec,
-		PreviewExecutor:     previewExec,
-		DefaultDownloadDir:  downloadDir,
-		RecentAssetChoices:  recentChoices,
-		PersistChoices:      persistChoices,
+		State:                   st,
+		DestinationService:      &workspace.Service{},
+		DownloadDirs:            projectContext.Config.DownloadDirs,
+		ProjectContext:          projectContext,
+		ManageLink:              linkService.Apply,
+		BrowserPreferences:      browserPreferences,
+		BrowserPreferencesError: browserErr,
+		SaveBrowserPreferences:  func(p browserprefs.Preferences) error { return browserprefs.Save(browserPath, p) },
+		DisableAutoRefresh:      !*autoRefresh,
+		ReducedMotion:           *reducedMotion,
+		RootNodeID:              rootNodeID,
+		LinkedRootNodeID:        linkedRootNodeID,
+		SubtreeRefreshDepth:     subtreeRefreshDepth,
+		RefreshExecutor:         refreshExec,
+		DownloadExecutor:        downloadExec,
+		PreviewExecutor:         previewExec,
+		SubmissionService:       submissionService(common),
+		DefaultDownloadDir:      downloadDir,
+		RecentAssetChoices:      recentChoices,
+		PersistChoices:          persistChoices,
 	}); err != nil {
 		fail(err, false, "")
 	}
@@ -1253,9 +1335,11 @@ func printUsage() {
 	fmt.Println("  check  Validate authentication and base URL access")
 	fmt.Println("  list   List available test case indices")
 	fmt.Println("  fetch  Download available test cases")
+	fmt.Println("  submit Review and upload assignment files; watch grading")
+	fmt.Println("  status Inspect or resume watching a submission")
 	fmt.Println("  login  Authenticate interactively or non-interactively")
 	fmt.Println("  auth   View or update global auth settings")
-	fmt.Println("  project Manage repository link metadata")
+	fmt.Println("  project Manage directory link metadata")
 	fmt.Println("  tui    Alias for `themis` (deprecated)")
 	fmt.Println()
 	fmt.Println("Common flags (all subcommands):")
@@ -1267,6 +1351,8 @@ func printUsage() {
 	fmt.Println("  list  --tests-url <url> [--start <n>] [--max <n>] [--max-misses <n>]")
 	fmt.Println("  list  --discover [--root-url <url>] [--discover-depth <n>] [--refresh-url <url>] [--refresh-depth <n>] [--full-refresh] [--from-state-only]")
 	fmt.Println("  fetch --tests-url <url> [--out <dir>]")
+	fmt.Println("  submit --assignment-url <url> --file <path>... [--folder <path>...] [--language <id>] [--dry-run] [--yes] [--watch=false] [--timeout 15m]")
+	fmt.Println("  status --submission-url <url> [--watch] [--timeout 15m]")
 	fmt.Println("  login [--username <value>] [--password <value>] [--totp <value>]")
 	fmt.Println("  auth [--username <value>] [--password <value>] [--save-username=<bool>] [--save-password=<bool>] [--clear-username] [--clear-password]")
 	fmt.Println("  project link --root-url <url> [--default-refresh-depth <n>]")

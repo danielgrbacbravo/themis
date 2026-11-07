@@ -30,11 +30,17 @@ func (m Model) layout() screenLayout {
 	l.statusHeight = 3
 	if m.height >= 14 {
 		l.statusHeight = 4
+		if m.height >= 18 {
+			l.statusHeight = 5
+		}
 	}
 	if m.height >= 18 {
 		l.summaryHeight = 5
 	} else if m.height >= 12 {
 		l.summaryHeight = 3
+	}
+	if m.browser.overlay != "" {
+		l.summaryHeight = 0
 	}
 	l.bodyHeight = m.height - l.summaryHeight - l.statusHeight
 	l.treeWidth = m.width / 2
@@ -53,14 +59,23 @@ func (m Model) View() string {
 	if l.tooSmall {
 		return textutil.Fit(fmt.Sprintf("Terminal too small\nResize to %d x %d\nCurrent: %d x %d\nq quit", minWidth, minHeight, m.width, m.height), m.width, m.height)
 	}
+	if m.browser.overlay == "search" || m.browser.overlay == "catalog" || m.browser.overlay == "recent" || m.browser.overlay == "destination" {
+		width, height := m.searchSize()
+		panel := renderPanel(m.renderBrowser(width-2, height-2), width, height, true)
+		return textutil.Fit(lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel), m.width, m.height)
+	}
 	panels := make([]string, 0, 3)
 	if l.summaryHeight > 0 {
 		panels = append(panels, renderPanel(m.renderCourseSummary(l.width-2, l.summaryHeight-2), l.width, l.summaryHeight, false))
 	}
 	h := l.bodyHeight - 2
 	var body string
-	if m.showHelp {
+	if m.browser.overlay != "" {
+		body = renderPanel(m.renderBrowser(l.width-2, h), l.width, l.bodyHeight, true)
+	} else if m.showHelp {
 		body = renderPanel(m.renderHelp(l.width-2, h), l.width, l.bodyHeight, true)
+	} else if m.submissionMode() {
+		body = m.renderSubmissionBody(l)
 	} else if m.mode == "download" {
 		body = m.renderDownloadBody(l)
 	} else if l.single {
@@ -160,7 +175,7 @@ func (m Model) renderTreeForSize(width, height int) string {
 		}
 		indent := strings.Repeat(" ", clamp(row.Depth*2, 0, maxInt(0, width/4)))
 		icon := taskIcon(row.ResultLabel, row.Status)
-		if row.HasChildren {
+		if row.HasChildren && (len(m.st.Nodes[row.NodeID].ChildIDs) > 0 || m.st.Nodes[row.NodeID].Kind != "assignment") {
 			icon = secondaryStyle.Render("▸")
 			if row.Expanded {
 				icon = secondaryStyle.Render("▾")
@@ -169,7 +184,18 @@ func (m Model) renderTreeForSize(width, height int) string {
 				icon += " " + passStyle.Render("✓")
 			}
 		}
-		line := prefix + indent + icon + " " + strings.Join(strings.Fields(row.Title), " ")
+		label := strings.Join(strings.Fields(row.Title), " ")
+		node := m.st.Nodes[row.NodeID]
+		if m.refreshTarget == row.NodeID {
+			label += " · loading…"
+		} else if node.Status == state.StatusError {
+			label += " · failed (r retries)"
+		} else if !node.ChildrenHydrated {
+			label += " · not loaded"
+		} else if len(node.ChildIDs) == 0 && node.Kind != "assignment" {
+			label += " · empty"
+		}
+		line := prefix + indent + icon + " " + label
 		line = truncateOneLine(line, width)
 		if i == m.selectedIndex {
 			line = selectedStyle.Render(line)
@@ -219,13 +245,22 @@ func (m Model) renderStatusForSize(width, height int) string {
 	if m.mode != "download" && m.detailsFocused {
 		mode = "DETAILS"
 	}
+	if m.browser.overlay != "" {
+		mode = strings.ToUpper(m.browser.overlay)
+	}
 	message := m.activityIcon() + " " + titleStyle.Render(mode) + "  " + m.statusText
-	keys := "j/k move  h/l fold  d files  tab details  ? help  q quit"
+	if m.browser.overlay == "search" && !m.refreshInFlight {
+		message = titleStyle.Render(mode) + "  Relevance first · newer years on ties"
+	}
+	if m.browser.notice != "" && m.browser.notice != m.statusText {
+		message += " · " + m.browser.notice
+	}
+	keys := "c courses  / search  P project  backspace back  j/k move  h/l fold  d files  u upload  v results  tab details  ? help"
 	if m.detailsFocused {
 		keys = "j/k scroll  pgup/pgdown page  tab tree  i source  ? help  q quit"
 	}
 	if m.mode == "download" {
-		keys = "j/k move  tab preview  space toggle  enter download  esc close"
+		keys = "j/k move  tab preview  space toggle  enter destination  esc close"
 		if m.preview.focused {
 			keys = "j/k scroll  pgup/pgdown page  tab files  r retry  esc close"
 		}
@@ -236,17 +271,35 @@ func (m Model) renderStatusForSize(width, height int) string {
 	if width < 60 {
 		keys = "? help  tab pane  q quit"
 	}
+	if m.submissionMode() {
+		keys = m.submissionKeys()
+	}
+	if m.browser.overlay != "" {
+		keys = "Tab Catalog / Recent · / Search"
+		if m.browser.overlay == "search" {
+			keys = "course: · year: · type: · status: · Ctrl+U clear"
+			if width < 60 {
+				keys = "Ctrl+U clear · Ctrl+W delete word"
+			}
+		}
+	}
+	if m.browser.overlay == "project" {
+		keys = "l link · c change · x remove · / directory · j/k scroll · esc close"
+	}
 	if m.showHelp {
 		keys = "j/k scroll  esc close  q quit"
 	}
 	if height == 1 {
 		return truncateOneLine(mode+" | ? help | "+m.statusText, width)
 	}
+	if height >= 3 {
+		return textutil.Fit(textutil.Truncate(m.contextLine(), width)+"\n"+message+"\n"+secondaryStyle.Render(keys), width, height)
+	}
 	return textutil.Fit(message+"\n"+secondaryStyle.Render(keys), width, height)
 }
 
 func (m Model) helpLines() []string {
-	content := "j/k or arrows: move / scroll\nh/l or left/right: fold / open tree\ng/G or home/end: first / last\npgup/pgdown: page\ntab: tree / details or files / preview\ni: show / hide source details\nr/R/f: refresh node / subtree / all\nd: files / live progress\np: linked project\nspace: toggle file\na/c: select all / clear\nenter: open / download\nesc/h/d: close files (active downloads continue)\nq / ctrl+c: quit"
+	content := "c: catalog / recent picker (tab switches)\n/: ranked search (course acronyms, codes, years, paths, status)\nSearch filters: course:pc year:26/27 type:exercise status:passed path:lab1\nSearch: arrows edit/select, ctrl+w delete word, ctrl+u delete before cursor\nP: inspect / manage directory link\nbackspace: previous browsing location\nPicker: enter opens, right browses children, left goes up, r retries\nj/k or arrows: move / scroll\nh/l or left/right: fold / open tree\ng/G or home/end: first / last\npgup/pgdown: page\ntab: tree / details or files / preview\ni: show / hide source details\nr/R/f: refresh node / subtree / all\nd: files / live progress\nu: upload local files\nv: submission results\nUpload: space select file/folder, l open folder, h parent, / path, L language, enter review\nReview: tab select Submit, enter activate\nResults: j/k select artifact, tab preview, r resume watch\np: linked project\nspace: toggle file\na/c: select all / clear\nenter: open / choose download destination\nDownload folders: enter use/open, n create nested folders, / path, left parent\nesc/h/d: close files (active downloads continue)\nq / ctrl+c: quit"
 	return strings.Split(textutil.Wrap(content, maxInt(1, m.width-2)), "\n")
 }
 
@@ -284,7 +337,7 @@ func (m Model) renderDownloadPanel(node state.Node, width, height int) string {
 	if m.downloadInFlight {
 		target = m.downloadTargetDir
 	}
-	header := []string{titleStyle.Render("Download"), "Node: " + displayTitle(node), "Target dir: " + target, secondaryStyle.Render("tab preview · space select"), ""}
+	header := []string{titleStyle.Render("Download"), "Node: " + displayTitle(node) + m.downloadContext(), "Target dir: " + target, secondaryStyle.Render("tab preview · space select · o destination"), ""}
 	lines := append([]string{}, header[:headerCount]...)
 	listHeight := maxInt(1, height-headerCount-footerCount)
 	start := visibleOffset(m.downloadOffset, m.downloadCursor, len(assets), listHeight)
@@ -316,6 +369,9 @@ func (m Model) renderDownloadPanel(node state.Node, width, height int) string {
 }
 
 func (m Model) updateDownloadKey(key string) (tea.Model, tea.Cmd) {
+	if key == "o" {
+		return m.openDestination()
+	}
 	if m.previewKey(key) {
 		return m, nil
 	}
@@ -355,7 +411,7 @@ func (m Model) updateDownloadKey(key string) (tea.Model, tea.Cmd) {
 		case "c":
 			m.downloadSelection = map[string]bool{}
 		case "enter":
-			return m.startDownload()
+			return m.openDestination()
 		}
 	}
 	return m, nil

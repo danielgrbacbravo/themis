@@ -56,25 +56,26 @@ func (m *Model) cancelPreview() {
 // Called after cursor normalization, so even asynchronous download progress or
 // window changes cannot fetch an out-of-range or previously selected asset.
 func (m *Model) syncPreview(previousMode string) tea.Cmd {
-	if m.mode != "download" {
+	if m.mode != "download" && m.mode != "upload" && m.mode != "results" {
 		if m.preview.url != "" {
 			m.cancelPreview()
 			m.preview.url = ""
 		}
 		return nil
 	}
-	if previousMode != "download" {
+	if previousMode != m.mode {
 		m.cancelPreview()
 		m.preview.url, m.preview.focused = "", false
 		m.preview.cache, m.preview.order = map[string]previewResult{}, nil
 	}
-	assets := m.selectedNodeAssets()
+	assets := m.previewAssets()
 	if len(assets) == 0 {
 		m.cancelPreview()
 		m.preview.url = ""
+		m.preview.result = previewResult{}
 		return nil
 	}
-	asset := assets[clamp(m.downloadCursor, 0, len(assets)-1)]
+	asset := assets[clamp(m.previewCursor(), 0, len(assets)-1)]
 	if asset.URL == m.preview.url {
 		return nil
 	}
@@ -85,7 +86,11 @@ func (m *Model) syncPreview(previousMode string) tea.Cmd {
 		m.preview.result = result
 		return nil
 	}
-	if m.previewExecutor == nil {
+	if asset.Kind == "directory" {
+		m.preview.result.err = fmt.Errorf("Folder · l opens it · Space selects its contents")
+		return nil
+	}
+	if m.previewExecutor == nil && m.mode != "upload" {
 		m.preview.result.err = fmt.Errorf("preview is unavailable")
 		return nil
 	}
@@ -95,12 +100,15 @@ func (m *Model) syncPreview(previousMode string) tea.Cmd {
 }
 
 func (m Model) startPreview(msg previewStartMsg) (tea.Model, tea.Cmd) {
-	if m.mode != "download" || msg.generation != m.preview.generation || msg.asset.URL != m.preview.url || !m.preview.loading {
+	if (m.mode != "download" && m.mode != "upload" && m.mode != "results") || msg.generation != m.preview.generation || msg.asset.URL != m.preview.url || !m.preview.loading {
 		return m, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	m.preview.cancel = cancel
 	exec := m.previewExecutor
+	if m.mode == "upload" {
+		exec = readLocalPreview
+	}
 	return m, func() tea.Msg {
 		defer cancel()
 		content, err := exec(ctx, msg.asset)
@@ -117,7 +125,7 @@ func (m Model) startPreview(msg previewStartMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) finishPreview(msg previewFinishedMsg) (tea.Model, tea.Cmd) {
-	if m.mode != "download" || msg.generation != m.preview.generation || msg.url != m.preview.url {
+	if (m.mode != "download" && m.mode != "upload" && m.mode != "results") || msg.generation != m.preview.generation || msg.url != m.preview.url {
 		return m, nil
 	}
 	m.preview.loading = false
@@ -198,7 +206,11 @@ func (m Model) previewLineCount() int {
 	}
 	width := m.width - 2
 	if m.width >= 80 {
-		width -= clamp(m.width/3, 28, 44)
+		if m.submissionMode() {
+			width -= clamp(m.width/2, 32, 60)
+		} else {
+			width -= clamp(m.width/3, 28, 44)
+		}
 	}
 	return len(m.pdfPreviewLines(width))
 }
@@ -211,11 +223,11 @@ func (m Model) renderPreview(width, height int) string {
 	if m.preview.focused {
 		title = "Preview · Tab to files"
 	}
-	assets := m.selectedNodeAssets()
+	assets := m.previewAssets()
 	name := "No file selected"
 	kind := fileType{label: "File"}
 	if len(assets) > 0 {
-		asset := assets[clamp(m.downloadCursor, 0, len(assets)-1)]
+		asset := assets[clamp(m.previewCursor(), 0, len(assets)-1)]
 		name = previewName(asset)
 		kind = assetFileType(asset)
 	}

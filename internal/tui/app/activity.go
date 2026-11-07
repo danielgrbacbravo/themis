@@ -19,11 +19,11 @@ func activityTick(generation uint64) tea.Cmd {
 }
 
 func (m Model) animating() bool {
-	return m.refreshInFlight || m.downloadInFlight || m.preview.loading || m.now.Before(m.successUntil)
+	return m.refreshInFlight || m.downloadInFlight || m.preview.loading || m.submit.busy || m.submit.watchActive || m.now.Before(m.successUntil)
 }
 
 func (m Model) activityIcon() string {
-	if m.refreshInFlight || m.downloadInFlight || m.preview.loading {
+	if m.refreshInFlight || m.downloadInFlight || m.preview.loading || m.submit.busy || m.submit.watchActive {
 		if m.reducedMotion {
 			return infoStyle.Render("↻")
 		}

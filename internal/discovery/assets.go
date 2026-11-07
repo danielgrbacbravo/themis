@@ -203,3 +203,59 @@ func sanitizeRelativePath(raw string, index int) string {
 	}
 	return filepath.Join(out...)
 }
+
+// AssetRelativePaths plans the same names for review and per-file downloads.
+func AssetRelativePaths(assets []state.AssetRef) []string {
+	used := map[string]int{}
+	paths := make([]string, len(assets))
+	for i, asset := range assets {
+		rel := resolveAssetRelativePath(asset, i+1)
+		candidate := dedupeRelativePath(rel, used)
+		for used[candidate] > 0 && candidate != rel {
+			candidate = dedupeRelativePath(rel, used)
+		}
+		used[candidate] = 1
+		paths[i] = candidate
+	}
+	return paths
+}
+
+// DownloadAssetToPath writes a reviewed filename rather than recomputing a
+// batch-dependent name. Newly appearing files are never silently replaced.
+func DownloadAssetToPath(client *http.Client, asset state.AssetRef, target string, overwrite bool) (DownloadedAsset, error) {
+	raw := asset.URL
+	if looksLikeThemisFile(raw) {
+		raw = ensureRawQuery(raw)
+	}
+	body, err := downloadRawFile(client, raw)
+	if err != nil {
+		return DownloadedAsset{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		return DownloadedAsset{}, err
+	}
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	if overwrite {
+		flags = os.O_WRONLY | os.O_TRUNC
+	} // A reviewed existing file must still exist.
+	if info, err := os.Lstat(target); err == nil {
+		if !info.Mode().IsRegular() {
+			return DownloadedAsset{}, fmt.Errorf("destination is not a regular file")
+		}
+	} else if !os.IsNotExist(err) {
+		return DownloadedAsset{}, err
+	}
+	f, err := os.OpenFile(target, flags, 0644)
+	if err != nil {
+		return DownloadedAsset{}, fmt.Errorf("open download destination: %w", err)
+	}
+	_, writeErr := f.Write(body)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return DownloadedAsset{}, writeErr
+	}
+	if closeErr != nil {
+		return DownloadedAsset{}, closeErr
+	}
+	return DownloadedAsset{Name: filepath.Base(target), URL: asset.URL, Path: target}, nil
+}

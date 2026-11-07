@@ -16,6 +16,7 @@ type Config struct {
 	LinkedRootURL      string              `json:"linked_root_url"`
 	LinkedRootNodeID   string              `json:"linked_root_node_id,omitempty"`
 	LastOpenNodeID     string              `json:"last_open_node_id,omitempty"`
+	DownloadDirs       map[string]string   `json:"download_dirs,omitempty"`
 	LastDownloadDir    string              `json:"last_download_dir,omitempty"`
 	RecentAssetChoices map[string][]string `json:"recent_asset_choices,omitempty"`
 	Preferences        Preferences         `json:"preferences"`

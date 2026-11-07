@@ -191,3 +191,30 @@ func TestDownloadAssetRefsSkipsSiteInfoFromOldCaches(t *testing.T) {
 		t.Fatalf("expected only assignment file, got %d requests and %d files", hits, len(downloaded))
 	}
 }
+
+func TestReviewedAssetPathsMatchWritesAndAvoidCollisions(t *testing.T) {
+	assets := []state.AssetRef{{Name: "main.c", URL: "https://example.test/main.c"}, {Name: "main-2.c", URL: "https://example.test/main-2.c"}, {Name: "main.c", URL: "https://example.test/other/main.c"}, {Name: "1.in", URL: "https://example.test/file/x/@tests/1.in"}}
+	paths := AssetRelativePaths(assets)
+	want := []string{"main.c", "main-2.c", "main-3.c", filepath.Join("tests", "1.in")}
+	for i, path := range paths {
+		if path != want[i] {
+			t.Fatalf("collision plan %v", paths)
+		}
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) { return okResponse(r, "downloaded"), nil })}
+	root := t.TempDir()
+	for i, asset := range assets {
+		target := filepath.Join(root, paths[i])
+		item, err := DownloadAssetToPath(client, asset, target, false)
+		if err != nil || item.Path != target {
+			t.Fatalf("write %+v %v", item, err)
+		}
+	}
+	target := filepath.Join(root, paths[0])
+	if _, err := DownloadAssetToPath(client, assets[0], target, false); err == nil {
+		t.Fatal("silently replaced an unreviewed file")
+	}
+	if _, err := DownloadAssetToPath(client, assets[0], target, true); err != nil {
+		t.Fatal("reviewed replacement failed", err)
+	}
+}

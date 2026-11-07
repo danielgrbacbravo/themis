@@ -16,6 +16,7 @@ import (
 	"themis-cli/internal/state"
 	"themis-cli/internal/tui/textutil"
 	"themis-cli/internal/tui/theme"
+	"themis-cli/internal/workspace"
 )
 
 var (
@@ -63,9 +64,12 @@ type RefreshOutcome struct {
 type RefreshExecutor func(st state.State, req RefreshRequest) RefreshOutcome
 
 type DownloadRequest struct {
-	NodeID    string
-	TargetDir string
-	Assets    []state.AssetRef
+	Root         string
+	RelativePath string
+	Overwrite    bool
+	NodeID       string
+	TargetDir    string
+	Assets       []state.AssetRef
 }
 
 type DownloadedFile struct {
@@ -98,6 +102,13 @@ type downloadFileFinishedMsg struct {
 }
 
 type Model struct {
+	destination         destinationUI
+	downloadDirs        map[string]string
+	downloadPlan        []workspace.File
+	downloadRoot        string
+	browser             browserState
+	refreshTarget       string
+	pendingLoads        []string
 	st                  state.State
 	rootNodeID          string
 	linkedRootNodeID    string
@@ -105,6 +116,7 @@ type Model struct {
 	refreshExecutor     RefreshExecutor
 	downloadExecutor    DownloadExecutor
 	preview             previewState
+	submit              submissionUI
 	previewExecutor     PreviewExecutor
 	persistChoices      PersistChoicesFunc
 	defaultDownloadDir  string
@@ -164,11 +176,26 @@ type treeRow struct {
 
 func NewModel(cfg Config) (Model, error) {
 	st := cfg.State
+	if st.Nodes == nil {
+		st.Nodes = map[string]state.Node{}
+	}
+	if st.CatalogRootURL == "" && st.BaseURL != "" {
+		st.CatalogRootURL = strings.TrimRight(st.BaseURL, "/") + "/course"
+	}
+	if st.CatalogRootURL != "" {
+		seedNode(&st, st.CatalogRootURL, "Courses", "catalog")
+	}
 	if len(st.Nodes) == 0 {
-		return Model{}, fmt.Errorf("state has no nodes; run discovery first")
+		return Model{}, fmt.Errorf("no Themis base URL configured")
 	}
 
 	resolvedRootID := cfg.RootNodeID
+	if resolvedRootID == "" && cfg.LinkedRootNodeID != "" {
+		resolvedRootID = cfg.LinkedRootNodeID
+	}
+	if resolvedRootID == "" && st.CatalogRootURL != "" {
+		resolvedRootID = state.NodeIDFromCanonicalURL(strings.TrimRight(st.CatalogRootURL, "/"))
+	}
 	if resolvedRootID == "" {
 		resolvedRootID = defaultRootNodeID(st)
 	}
@@ -188,6 +215,9 @@ func NewModel(cfg Config) (Model, error) {
 	}
 
 	m := Model{
+		destination:         destinationUI{service: cfg.DestinationService},
+		downloadDirs:        cloneDirectories(cfg.DownloadDirs),
+		browser:             browserState{project: cfg.ProjectContext, manageLink: cfg.ManageLink, preferences: cfg.BrowserPreferences, savePreferences: cfg.SaveBrowserPreferences},
 		st:                  st,
 		autoRefreshPending:  !cfg.DisableAutoRefresh && cfg.RefreshExecutor != nil,
 		reducedMotion:       cfg.ReducedMotion,
@@ -198,6 +228,7 @@ func NewModel(cfg Config) (Model, error) {
 		refreshExecutor:     cfg.RefreshExecutor,
 		downloadExecutor:    cfg.DownloadExecutor,
 		previewExecutor:     cfg.PreviewExecutor,
+		submit:              submissionUI{service: cfg.SubmissionService},
 		persistChoices:      cfg.PersistChoices,
 		defaultDownloadDir:  strings.TrimSpace(cfg.DefaultDownloadDir),
 		recentAssetChoices:  cloneChoiceMap(cfg.RecentAssetChoices),
@@ -219,6 +250,14 @@ func NewModel(cfg Config) (Model, error) {
 		statusText:     "Cached course · r to refresh",
 	}
 	m.rebuildFlat()
+	if cfg.BrowserPreferencesError != nil {
+		m.statusText = "Browser preferences: " + cfg.BrowserPreferencesError.Error()
+		m.browser.notice = m.statusText
+	}
+	if node := m.st.Nodes[m.rootNodeID]; node.LastSuccessAt == nil && node.Status == state.StatusNever && m.refreshExecutor != nil {
+		m.autoRefreshPending = true
+	}
+
 	return m, nil
 }
 
@@ -242,6 +281,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if previewCmd := next.syncPreview(m.mode); previewCmd != nil {
 		cmd = tea.Batch(cmd, previewCmd)
 	}
+	if !next.refreshInFlight && !next.downloadInFlight && len(next.pendingLoads) > 0 {
+		id := next.pendingLoads[0]
+		next.pendingLoads = next.pendingLoads[1:]
+		refreshed, loadCmd := next.startRefreshAt(id, RefreshScopeNode, 0)
+		next = refreshed.(Model)
+		cmd = tea.Batch(cmd, loadCmd)
+	}
+	if next.submit.refreshPending != "" && !next.refreshInFlight && !next.downloadInFlight {
+		target := next.submit.refreshPending
+		next.submit.refreshPending = ""
+		refreshed, refreshCmd := next.startRefreshAt(target, RefreshScopeNode, 0)
+		next = refreshed.(Model)
+		cmd = tea.Batch(cmd, refreshCmd)
+	}
 	if !next.reducedMotion && next.animating() && !next.animationRunning {
 		next.animationRunning = true
 		next.animationGeneration++
@@ -251,6 +304,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if next, cmd, handled := m.destinationMessage(msg); handled {
+		return next, cmd
+	}
+	if next, cmd, handled := m.updateSubmission(msg); handled {
+		return next, cmd
+	}
 	switch msg := msg.(type) {
 	case previewStartMsg:
 		return m.startPreview(msg)
@@ -285,6 +344,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.animationFrame = (m.animationFrame + 1) % 60
 		return m, activityTick(m.animationGeneration)
 	case tea.WindowSizeMsg:
+		m.submit.input.Width = maxInt(8, msg.Width-12)
 		m.width = maxInt(0, msg.Width)
 		m.height = maxInt(0, msg.Height)
 		if m.mode == "download" {
@@ -293,10 +353,25 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case refreshFinishedMsg:
 		m.refreshInFlight = false
+		m.refreshTarget = ""
 		out := msg.Outcome
 		if out.Err != nil {
 			m.statusText = fmt.Sprintf("refresh failed (%s): %v", out.Scope, out.Err)
+			node, exists := m.st.Nodes[out.TargetNodeID]
+			if !exists {
+				return m, nil
+			}
+			node.Status = state.StatusError
+			node.LastError = out.Err.Error()
+			m.st.Nodes[out.TargetNodeID] = node
 			return m, nil
+		}
+		if len(out.State.Nodes) > 0 {
+			for id, node := range m.st.Nodes {
+				if _, ok := out.State.Nodes[id]; !ok && node.LastSuccessAt == nil {
+					out.State.Nodes[id] = node
+				}
+			}
 		}
 		if _, ok := out.State.Nodes[m.rootNodeID]; !ok {
 			m.statusText = "refresh failed: refreshed state is missing the current root"
@@ -305,6 +380,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.now = time.Now()
 		m.successUntil = m.now.Add(900 * time.Millisecond)
 		m.st = out.State
+		m.browser.searchDocuments = nil
+		if m.browser.overlay == "search" {
+			m.browser.searchDocuments = m.buildSearchDocuments()
+		}
 		m.courseSummary = state.ComputeCourseSummary(m.st, m.rootNodeID, time.Now())
 		// Preserve the user's current selection while a refresh is running.
 		m.ensureVisible(m.selectedNodeID)
@@ -325,8 +404,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.finalizeDownloadBatch(), nil
 	case tea.KeyMsg:
 		key := msg.String()
+		if m.browser.overlay != "" {
+			return m.updateBrowserKey(msg)
+		}
 		if key == "ctrl+c" || key == "q" {
 			m.cancelPreview()
+			m.stopSubmission()
 			return m, tea.Quit
 		}
 		if key == "?" {
@@ -352,6 +435,31 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.helpOffset = len(m.helpLines())
 			}
 			return m, nil
+		}
+		if m.mode == "browse" {
+			switch key {
+			case "c":
+				m.browser.overlay = "catalog"
+				m.browser.container = m.catalogID()
+				m.browser.cursor = 0
+				return m.loadBranch(m.browser.container)
+			case "/":
+				m.beginSearch()
+				return m, nil
+			case "P":
+				m.openProject()
+				return m, nil
+			case "backspace", "ctrl+h":
+				return m.goBack(), nil
+			case "p":
+				return m.openLinked()
+			}
+		}
+		if key == "u" && m.mode == "browse" {
+			return m.openUpload()
+		}
+		if key == "v" && m.mode == "browse" {
+			return m.openResults()
 		}
 		if m.mode == "download" {
 			return m.updateDownloadKey(key)
@@ -399,7 +507,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "left", "h":
 			m.collapseOrMoveToParent()
 		case "right", "l", "enter":
+			node := m.selectedNode()
+			if node != nil && (node.Kind == "course") && node.ID != m.rootNodeID {
+				return m.openLocation(node.ID)
+			}
 			m.expandSelection()
+			if node != nil && !node.ChildrenHydrated {
+				return m.loadBranch(node.ID)
+			}
 		case "g", "home":
 			m.selectedIndex = 0
 			m.syncSelectedNodeID()
@@ -413,19 +528,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.selectedIndex += step
 			m.syncSelectedNodeID()
-		case "p":
-			if m.linkedRootNodeID == "" {
-				m.statusText = "no linked project root configured"
-				return m, nil
-			}
-			if !m.ensureVisible(m.linkedRootNodeID) {
-				m.statusText = "linked project root not found in current tree"
-				return m, nil
-			}
-			m.selectedNodeID = m.linkedRootNodeID
-			m.rebuildFlat()
-			m.detailsFocused = false
-			m.statusText = "jumped to linked project root"
+
 		case "d":
 			return m.openDownloadMode()
 		case "r":
@@ -436,6 +539,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.startRefresh(RefreshScopeFull, m.subtreeRefreshDepth)
 		}
 
+	}
+	if m.browser.overlay == "search" {
+		return m.updateSearchInput(msg)
+	}
+	if m.browser.overlay == "destination" && (m.destination.phase == "path" || m.destination.phase == "create") {
+		return m.updateDestinationInput(msg)
 	}
 	return m, nil
 }
@@ -479,6 +588,7 @@ func (m Model) startRefreshAt(nodeID string, scope RefreshScope, depth int) (tea
 		return m, nil
 	}
 	m.refreshInFlight = true
+	m.refreshTarget = targetID
 	m.statusText = "Updating " + displayTitle(node) + "…"
 	exec := m.refreshExecutor
 	req := RefreshRequest{
@@ -520,6 +630,8 @@ func (m Model) openDownloadMode() (tea.Model, tea.Cmd) {
 	m.downloadOffset = 0
 	m.downloadSelection = map[string]bool{}
 	m.resetDownloadProgress()
+	m.downloadPlan = nil
+	m.downloadRoot = ""
 
 	if recent, ok := m.recentAssetChoices[m.selectedNodeID]; ok && len(recent) > 0 {
 		for _, url := range recent {
@@ -659,7 +771,7 @@ func (m *Model) rebuildFlat() {
 			URL:         node.CanonicalURL,
 			Status:      node.Status,
 			ResultLabel: m.nodeResultLabel(node),
-			HasChildren: len(node.ChildIDs) > 0,
+			HasChildren: len(node.ChildIDs) > 0 || !node.ChildrenHydrated,
 			Expanded:    m.expanded[nodeID],
 			ParentID:    parentID,
 		}
@@ -798,6 +910,9 @@ func (m *Model) collapseOrMoveToParent() {
 }
 
 func (m Model) renderCourseSummary(maxWidth int, maxLines int) string {
+	if m.st.Nodes[m.rootNodeID].Kind == "catalog" || m.st.Nodes[m.rootNodeID].Kind == "year" {
+		return textutil.Fit("Browse Themis\n"+m.locationLabel(m.rootNodeID)+"\nc courses · / search downloaded catalog · P project", maxWidth, maxLines)
+	}
 	summary := m.courseSummary
 	lines := []string{titleStyle.Render("Course Summary")}
 	if summary.TotalAssignments == 0 {
@@ -982,6 +1097,11 @@ func (m Model) downloadNextCmd() tea.Cmd {
 		TargetDir: m.downloadTargetDir,
 		Assets:    []state.AssetRef{asset},
 	}
+	if len(m.downloadPlan) == len(m.downloadQueue) {
+		req.Root = m.downloadRoot
+		req.RelativePath = m.downloadPlan[index].Relative
+		req.Overwrite = m.downloadPlan[index].Exists
+	}
 	return func() tea.Msg {
 		out := exec(stSnapshot, req)
 		return downloadFileFinishedMsg{Index: index, BatchID: batchID, AssetURL: asset.URL, Outcome: out}
@@ -1014,6 +1134,7 @@ func (m Model) finalizeDownloadBatch() Model {
 	m.downloadState = state.State{}
 	duration := time.Since(m.downloadStartedAt).Milliseconds()
 	m.defaultDownloadDir = m.downloadTargetDir
+	m.downloadDirs[m.downloadNodeID] = m.downloadTargetDir
 
 	if m.downloadFailed > 0 {
 		m.statusText = fmt.Sprintf("download finished: %d ok, %d failed in %dms", m.downloadDone, m.downloadFailed, duration)
@@ -1648,4 +1769,12 @@ func snapshotState(st state.State) (state.State, error) {
 		return state.State{}, fmt.Errorf("snapshot state: %w", err)
 	}
 	return snapshot, nil
+}
+
+func cloneDirectories(src map[string]string) map[string]string {
+	dst := map[string]string{}
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }

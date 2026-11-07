@@ -63,7 +63,7 @@ func resultLabel(raw string) string {
 }
 
 func (m Model) updatedLabel(node state.Node) string {
-	if m.refreshInFlight {
+	if m.refreshInFlight && m.refreshTarget == node.ID {
 		return "Updating…"
 	}
 	if node.LastSuccessAt == nil {

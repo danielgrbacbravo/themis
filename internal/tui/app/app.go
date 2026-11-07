@@ -5,22 +5,34 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"themis-cli/internal/browserprefs"
+	"themis-cli/internal/projectlink"
 	"themis-cli/internal/state"
+	"themis-cli/internal/submission"
+	"themis-cli/internal/workspace"
 )
 
 type Config struct {
-	State               state.State
-	DisableAutoRefresh  bool
-	ReducedMotion       bool
-	RootNodeID          string
-	LinkedRootNodeID    string
-	SubtreeRefreshDepth int
-	RefreshExecutor     RefreshExecutor
-	DownloadExecutor    DownloadExecutor
-	PreviewExecutor     PreviewExecutor
-	DefaultDownloadDir  string
-	RecentAssetChoices  map[string][]string
-	PersistChoices      PersistChoicesFunc
+	DestinationService      *workspace.Service
+	DownloadDirs            map[string]string
+	ProjectContext          projectlink.Context
+	ManageLink              func(projectlink.Change) (projectlink.Context, error)
+	BrowserPreferences      browserprefs.Preferences
+	SaveBrowserPreferences  func(browserprefs.Preferences) error
+	BrowserPreferencesError error
+	State                   state.State
+	DisableAutoRefresh      bool
+	ReducedMotion           bool
+	RootNodeID              string
+	LinkedRootNodeID        string
+	SubtreeRefreshDepth     int
+	RefreshExecutor         RefreshExecutor
+	DownloadExecutor        DownloadExecutor
+	PreviewExecutor         PreviewExecutor
+	SubmissionService       *submission.Service
+	DefaultDownloadDir      string
+	RecentAssetChoices      map[string][]string
+	PersistChoices          PersistChoicesFunc
 }
 
 func Run(cfg Config) error {
@@ -30,7 +42,12 @@ func Run(cfg Config) error {
 	}
 
 	program := tea.NewProgram(model, tea.WithAltScreen())
-	if _, err := program.Run(); err != nil {
+	final, err := program.Run()
+	if m, ok := final.(Model); ok {
+		m.stopSubmission()
+		m.cancelPreview()
+	}
+	if err != nil {
 		return fmt.Errorf("run tui: %w", err)
 	}
 	return nil

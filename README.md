@@ -110,7 +110,7 @@ Default output directory is `./tests` for the `fetch` command (resolved to absol
 If missing, it is created automatically. Override with `--out`.
 
 ### project link
-Link the current repository to a Themis course root so state-first discovery and TUI can resolve the active root without `--root-url`.
+Link the current directory to a Themis course or assignment so state-first discovery and TUI can resolve the active root without `--root-url`.
 
 ```sh
 ./themis project link \
@@ -119,7 +119,7 @@ Link the current repository to a Themis course root so state-first discovery and
   --default-refresh-depth 1
 ```
 
-This writes `.themis/project.json` in the repo root.
+This writes `.themis/project.json` in the current directory. A subdirectory inherits the nearest parent link; a link in the subdirectory overrides it. Existing repository-root links continue to work.
 
 Refresh a linked project and update local state:
 
@@ -127,7 +127,19 @@ Refresh a linked project and update local state:
 ./themis project refresh --depth 8
 ```
 
-This prints progress as each Themis page is fetched. Bare `./themis` also detects a linked project root that is missing from local state and offers to refresh it before opening the TUI.
+This prints progress as each Themis page is fetched. Bare `./themis` opens the linked target immediately and loads missing data in the background. Without a directory link it opens the course catalog, including on a fresh installation.
+
+### Browse and manage directory links
+
+- **c** opens the compact centered Catalog/Recent picker; **Tab** switches sections. Rows show titles and course codes, with the year/course context shown once per branch and extra details only for the selected item. Recents retain course/year columns to distinguish entries from different branches. Enter opens a year or course; Right browses a selected branch, Left returns to its parent, and Escape closes the picker. Unloaded branches load one page at a time; **r** retries failed requests.
+- **/** opens ranked fuzzy search across downloaded titles, course codes, course acronyms, academic years, assignment paths, and grading status. For example, **PC** finds **Parallel Computing** and its exercises even if its URL code is `parcomp`. Matching ignores case, accents, punctuation, and spacing differences such as `lab1` / `Lab 1` / `lab_1`; official titles remain unchanged. Multiple words can match different metadata fields.
+- Narrow searches with `course:pc`, `year:26/27`, `type:course`, `type:exercise`, `status:passed`, `path:lab1`, or `title:vector`. Combine them, for example `course:pc year:26/27 status:passed`. Exact names/codes and word matches rank above loose fuzzy matches; equally relevant results show newer academic years first. Catalog years are also listed newest first. This searches downloaded metadata, not undiscovered server content.
+- Search supports Left/Right, Home/End, Ctrl+W (delete word), and Ctrl+U (delete before the cursor). Up/Down or Ctrl+P/Ctrl+N select a result; Enter opens it and Escape restores browsing. Search uses a compact centered picker with aligned title/course/year columns. Only the selected result shows its full location and grading outcome; cache labels and the background workspace panel stay out of search. Press **F1** to show or hide filter examples. Search and navigation controls stay visible.
+- Recent locations are deduplicated and limited to 20, stored separately in `~/.config/themis/browser.json`.
+- **Backspace** restores the previous browsing location, selection, and expanded branches. **p** opens the linked target even when it is outside the current tree.
+- **P** opens project context: launch directory, inherited link directory, exact configuration file, linked target, and resolved download destination. **l** links the selected target in the chosen directory; **c** changes the effective inherited link; **x** removes only its configuration file. **/** edits the new link directory (an existing directory, defaulting to the launch directory). Each mutation shows the exact file and target for review; Enter confirms and Escape cancels. Removing a child link can reveal a parent association.
+- Browsing leaves the directory link, working directory, and file destination unchanged. File selection shows the absolute download destination and flags browsing outside the linked target. Changing a link explicitly re-resolves project context. Link targets must belong to the configured Themis instance.
+- The context footer shows the current remote location and linked directory when space permits. The project screen remains scrollable on narrow terminals.
 
 TUI behavior:
 - Opens cached state immediately, then refreshes the displayed course in the background (at least two levels, or the configured deeper refresh depth). Catalog/year roots refresh only their own page to avoid a broad startup crawl. Use `--auto-refresh-on-open=false` to keep startup cache-only.
@@ -149,6 +161,16 @@ TUI behavior:
   - `✗` failed
   - `·` pending
 - Uses your terminal’s ANSI palette and default foreground/background colors. Selection uses a pointer and bold text without background bars. Labels and hints retain the default foreground for contrast; muted color is reserved for decoration. Theme and system appearance changes apply without restarting the TUI.
+
+### Choose download folders
+
+Press **d** on an assignment to select files, then **Enter** (or **o**) to choose where they go. The folder picker starts inside the linked project, even when Themis was launched from a deeper subdirectory. Without a link it uses the launch directory.
+
+- Select a child folder and press **Enter** or **Right** to open it; **Left** returns to its parent. Select **Use this folder** to review the destination.
+- Press **n** to create a folder. Nested names such as `pc-lab-07/pc-lab-07-e01` create the whole structure and open the new folder.
+- Press **/** to enter an existing folder path inside the project. Symlink folders are excluded, and navigation stays inside the project root.
+- Review shows the chosen folder, exact relative output filenames, and any existing files that will be replaced. **Enter** starts downloading; **Escape** returns to folder selection. Escape from the picker returns to file selection without changing the destination.
+- Each assignment remembers its own folder in `.themis/project.json` (`download_dirs`, relative to the link directory). A different assignment starts at the project root rather than inheriting an unrelated exercise folder. Folder creation takes effect when confirmed; leaving the picker does not remove folders you created.
 
 Download path rules in TUI:
 - `%40tests` assets download under `./tests/...`
@@ -231,3 +253,80 @@ Additional fields may be present depending on command:
 - `mode`, `root_url`, `refreshed`, `refresh_scope` (`list --discover`)
 
 Logs and human-readable output are written to stderr/non-JSON mode; JSON mode keeps stdout machine-parseable.
+
+### Submit files and watch grading
+
+Select an assignment in the TUI and press **u**. The local picker starts in the
+current directory. Space selects a file or an entire folder, `l` opens a folder,
+`h` goes to its parent, and `/` enters a directory path. Tab switches between the
+picker and its source/PDF preview; narrow terminals show one pane at a time.
+
+Enter prepares a private snapshot and opens review. Review lists the submitting
+account/group, language, exact filenames, combined size, server limits, and dates.
+Use `L` to change the language. **Tab selects Submit; Enter activates it.** The
+initial action is Back. Uploading happens only after this explicit action.
+
+The equivalent CLI flow is:
+
+```sh
+# Validate and inspect the manifest without posting anything.
+./themis submit --assignment-url 'https://themis.housing.rug.nl/course/YEAR/COURSE/EXERCISE' \
+  --file ./main.c --folder ./support --dry-run
+
+# Review interactively, submit, and watch grading.
+./themis submit --assignment-url 'https://themis.housing.rug.nl/course/YEAR/COURSE/EXERCISE' \
+  --file ./main.c --folder ./support
+
+# Inspect or resume watching a concrete submission URL returned by Themis.
+./themis status --submission-url 'https://themis.housing.rug.nl/submission/…/@submissions/GROUP/ID' --watch
+```
+
+`--file` and `--folder` are repeatable. Folders retain their folder-relative names;
+`.git`, `.themis`, and symlinks are excluded. Archives are uploaded as ordinary
+files. Server filename rules, file count, and **combined byte limits** are read
+from the live form. One permitted language is chosen automatically; otherwise
+an unambiguous extension match is suggested, or choose `--language LANGUAGE`.
+Changed server requirements require another review before uploading.
+
+Noninteractive uploads require `--yes`. `--dry-run` never posts. Submission
+watching defaults to true; use `--watch=false` to return after acceptance.
+`--timeout 15m` controls the watch deadline. `--json` produces one final JSON
+object on stdout, with the manifest and progress on stderr during an upload.
+Receipts include the concrete submission URL and a status link.
+
+In the TUI, **v** opens the selected assignment's remembered submission or latest
+result. Results distinguish scores from execution progress, list individual test
+verdicts, and preview compiler logs, output, and diffs. Use `j/k` to select an
+artifact, Tab to preview it, and Page Up/Down to scroll results. Grading monitoring
+continues after Escape returns to browsing. Opening a different result pauses the
+previous watch. `r` resumes a paused watch; when focused on a preview, `r` reloads
+that preview. Quitting stops local monitoring, not server grading.
+
+Polling uses two-second intervals and backs off to 4, 8, 16, then 30 seconds on
+transient errors. It pauses after five consecutive failures and stops on a final
+verdict, an explicit unjudged state, session expiry, or the watch deadline.
+Compilation errors are terminal even if individual tests have no verdict.
+
+Uploads are never automatically retried. If acceptance cannot be established,
+the client reports **Submission outcome unknown** and preserves a status link.
+Inspect that status before considering another upload. A generic history page or
+an older result is not treated as proof that the upload succeeded.
+
+Receipts and last known results are saved atomically in
+`~/.config/themis/submissions.json` with private permissions, separately from course
+state. CSRF tokens and source contents are not saved there. Reviewed source
+snapshots are private temporary files and are removed on completion/cancellation.
+Assignment statistics refresh after acceptance and final grading.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Accepted without waiting, passed, or successful preparation/status inspection |
+| 1 | Request or preparation failure |
+| 2 | Terminal unsuccessful grading, including explicitly unjudged |
+| 3 | Watch timeout, paused watch, or uncertain submission outcome |
+| 130 | User interruption |
+
+This workflow supports ordinary file submission forms. It does not support exam
+or quiz answer forms, automatic resubmission, watch-on-save, remote cancellation,
+or rejudging. Use only local test servers for automated upload validation; a real
+submission requires a designated exercise and explicit authorization.
