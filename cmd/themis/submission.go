@@ -36,13 +36,13 @@ func (t requestContextTransport) RoundTrip(r *http.Request) (*http.Response, err
 }
 func submissionService(common *commonFlags) *submission.Service {
 	return &submission.Service{BaseURL: common.baseURL, Store: &submission.Store{Path: submission.DefaultStorePath()}, Client: func() (*http.Client, error) {
-		s, err := themis.LoadSessionWithAuthConfig(common.baseURL, themis.AuthConfig{SessionFile: common.sessionFile})
+		s, err := themis.NewSessionWithAuthConfig(common.baseURL, themis.AuthConfig{SessionFile: common.sessionFile})
 		if err != nil {
 			return nil, err
 		}
 		return s.Client, nil
 	}, AfterChange: func(ctx context.Context, assignment string) error {
-		session, err := themis.LoadSessionWithAuthConfig(common.baseURL, themis.AuthConfig{SessionFile: common.sessionFile})
+		session, err := themis.NewSessionWithAuthConfig(common.baseURL, themis.AuthConfig{SessionFile: common.sessionFile})
 		if err != nil {
 			return err
 		}

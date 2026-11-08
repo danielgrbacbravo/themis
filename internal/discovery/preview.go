@@ -17,6 +17,11 @@ import (
 // PreviewAsset reads at most one bounded prefix with the authenticated client.
 // Cancellation and deadlines are owned by the caller; no files are persisted.
 func PreviewAsset(ctx context.Context, client *http.Client, asset state.AssetRef) (filepreview.Content, error) {
+	return ReadAsset(ctx, client, asset, filepreview.MaxBytes)
+}
+
+// ReadAsset supports bounded document reads as well as short TUI previews.
+func ReadAsset(ctx context.Context, client *http.Client, asset state.AssetRef, textLimit int) (filepreview.Content, error) {
 	var content filepreview.Content
 	if state.IsSiteInfoURL(asset.URL) {
 		return content, fmt.Errorf("site information has no file preview")
@@ -51,7 +56,10 @@ func PreviewAsset(ctx context.Context, client *http.Client, asset state.AssetRef
 	body := bufio.NewReader(resp.Body)
 	prefix, _ := body.Peek(512)
 	pdfFile := filepreview.IsPDF(asset.Name, prefix) || filepreview.IsPDF(asset.URL, nil) || strings.HasPrefix(resp.Header.Get("Content-Type"), "application/pdf")
-	limit := filepreview.MaxBytes
+	limit := textLimit
+	if limit < 1 || limit > filepreview.MaxPDFBytes {
+		return content, fmt.Errorf("invalid asset read limit")
+	}
 	if pdfFile {
 		limit = filepreview.MaxPDFBytes
 	}

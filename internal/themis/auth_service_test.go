@@ -101,7 +101,7 @@ func newAuthServiceTestServer() *httptest.Server {
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, "ok")
 			return
-		case "/user":
+		case "/user", "/course/":
 			cookie, err := r.Cookie("session")
 			if err != nil || cookie.Value != "ok" {
 				w.WriteHeader(http.StatusUnauthorized)

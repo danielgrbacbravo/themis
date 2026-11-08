@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"golang.org/x/term"
 	"io"
 	"os"
 	"path/filepath"
@@ -58,6 +59,8 @@ func main() {
 	}
 
 	switch args[0] {
+	case "capabilities", "catalog", "search", "show", "assets", "setup", "downloads":
+		os.Exit(runAgentCLI(args[0], args[1:]))
 	case "submit":
 		os.Exit(runSubmit(args[1:]))
 	case "status":
@@ -69,10 +72,16 @@ func main() {
 	case "fetch":
 		runFetch(args[1:])
 	case "project":
+		if len(args) > 1 && (args[1] == "inspect" || args[1] == "unlink") {
+			os.Exit(runAgentCLI("project", args[1:]))
+		}
 		runProject(args[1:])
 	case "login":
 		runLogin(args[1:])
 	case "auth":
+		if len(args) > 1 && args[1] == "status" {
+			os.Exit(runAgentCLI("auth", args[1:]))
+		}
 		runAuth(args[1:])
 	case "tui":
 		runAppTUI(args[1:])
@@ -545,6 +554,7 @@ func runProjectLink(args []string) {
 	jsonRequested := wantsJSON(args)
 	fs := newFlagSet("project link")
 	common := addCommonFlags(fs)
+	directory := fs.String("dir", ".", "Existing directory to link")
 	rootURL := fs.String("root-url", "", "Course or assignment URL to link to the current directory")
 	lastOpenNodeID := fs.String("last-open-node-id", "", "Optional last opened node id")
 	defaultRefreshDepth := fs.Int("default-refresh-depth", 1, "Default refresh depth for linked project")
@@ -564,11 +574,18 @@ func runProjectLink(args []string) {
 		fail(fmt.Errorf("--show-stale-warning-after-minutes must be >= 1"), common.jsonOutput, "")
 	}
 
-	repoRoot, err := filepath.Abs(".")
+	repoRoot, err := filepath.Abs(*directory)
 	if err != nil {
 		fail(err, common.jsonOutput, "")
 	}
 
+	info, dirErr := os.Stat(repoRoot)
+	if dirErr != nil {
+		fail(dirErr, common.jsonOutput, common.baseURL)
+	}
+	if !info.IsDir() {
+		fail(fmt.Errorf("--dir must be an existing directory"), common.jsonOutput, common.baseURL)
+	}
 	canonicalRootURL, err := state.CanonicalizeURL(*rootURL)
 	if err != nil {
 		fail(err, common.jsonOutput, common.baseURL)
@@ -745,17 +762,18 @@ func runLogin(args []string) {
 	common := addCommonFlags(fs)
 	username := fs.String("username", "", "Username for non-interactive login")
 	password := fs.String("password", "", "Password for non-interactive login")
-	totp := fs.String("totp", "", "TOTP code for non-interactive login")
+	totp := fs.String("totp", "", "TOTP code for non-interactive login (overrides saved key)")
+	nonInteractiveFlag := fs.Bool("non-interactive", false, "Use saved credentials and authenticator key without prompts")
 	if err := fs.Parse(args); err != nil {
 		fail(err, jsonRequested, "")
 	}
 
 	inputs := loginInputs{
 		username: strings.TrimSpace(*username),
-		password: strings.TrimSpace(*password),
+		password: *password,
 		totp:     strings.TrimSpace(*totp),
 	}
-	nonInteractive := inputs.username != "" || inputs.password != "" || inputs.totp != ""
+	nonInteractive := *nonInteractiveFlag || common.jsonOutput || inputs.username != "" || inputs.password != "" || inputs.totp != ""
 
 	if !nonInteractive {
 		if common.jsonOutput {
@@ -834,9 +852,14 @@ func runNonInteractiveLogin(common commonFlags, inputs loginInputs) (themis.User
 	}
 	sessionBaseURL := authService.BaseURL
 
-	_, userData, err := authService.VerifySession()
+	// An explicit OTP must override the saved key if login is needed.
+	session, err := themis.LoadSessionWithAuthConfig(sessionBaseURL, authService.Config)
 	if err == nil {
-		return userData, sessionBaseURL, nil
+		var userData themis.UserData
+		userData, err = session.ValidateAuthentication()
+		if err == nil {
+			return userData, sessionBaseURL, nil
+		}
 	}
 	if !errors.Is(err, themis.ErrSessionExpired) && !errors.Is(err, themis.ErrNotAuthenticated) {
 		return themis.UserData{}, sessionBaseURL, err
@@ -865,6 +888,8 @@ func runAuth(args []string) {
 	savePassword := fs.Bool("save-password", false, "Persist password in auth settings")
 	clearUsername := fs.Bool("clear-username", false, "Clear saved username (also clears password)")
 	clearPassword := fs.Bool("clear-password", false, "Clear saved password")
+	totpSecretStdin := fs.Bool("totp-secret-stdin", false, "Save an authenticator key from stdin (masked when entered in a terminal)")
+	clearTOTP := fs.Bool("clear-totp-secret", false, "Remove the saved authenticator key")
 	if err := fs.Parse(args); err != nil {
 		fail(err, jsonRequested, "")
 	}
@@ -873,14 +898,20 @@ func runAuth(args []string) {
 	fs.Visit(func(f *flag.Flag) {
 		visited[f.Name] = true
 	})
-	mutating := visited["username"] || visited["password"] || visited["save-username"] || visited["save-password"] || *clearUsername || *clearPassword
+	mutating := visited["username"] || visited["password"] || visited["save-username"] || visited["save-password"] || *clearUsername || *clearPassword || *totpSecretStdin || *clearTOTP
 
 	auth, err := themis.LoadAuthSettings(common.sessionFile)
 	if err != nil {
 		fail(err, common.jsonOutput, common.baseURL)
 	}
 
+	if *totpSecretStdin && *clearTOTP {
+		fail(fmt.Errorf("choose either --totp-secret-stdin or --clear-totp-secret"), common.jsonOutput, common.baseURL)
+	}
 	if mutating {
+		if visited["username"] && strings.TrimSpace(*username) != auth.Username {
+			auth.TOTPSecret, auth.TOTPBaseURL = "", ""
+		}
 		if visited["username"] {
 			auth.Username = strings.TrimSpace(*username)
 		}
@@ -904,6 +935,26 @@ func runAuth(args []string) {
 			auth.SavePassword = false
 		}
 
+		if *clearUsername || *clearTOTP {
+			auth.TOTPSecret, auth.TOTPBaseURL = "", ""
+		}
+		if *totpSecretStdin {
+			if !auth.SaveUsername || auth.Username == "" {
+				fail(fmt.Errorf("save a username before storing an authenticator key"), common.jsonOutput, common.baseURL)
+			}
+			if *clearUsername {
+				fail(fmt.Errorf("cannot store a key while clearing the username"), common.jsonOutput, common.baseURL)
+			}
+			secret, readErr := readAuthenticatorKey(os.Stdin, os.Stderr)
+			if readErr != nil {
+				fail(readErr, common.jsonOutput, common.baseURL)
+			}
+			auth.TOTPSecret = secret
+			auth.TOTPBaseURL, err = themis.NormalizeBaseURL(common.baseURL)
+			if err != nil {
+				fail(err, common.jsonOutput, common.baseURL)
+			}
+		}
 		if err := themis.SaveAuthSettings(common.sessionFile, auth); err != nil {
 			fail(err, common.jsonOutput, common.baseURL)
 		}
@@ -918,7 +969,7 @@ func runAuth(args []string) {
 			"status":        "ok",
 			"base_url":      common.baseURL,
 			"session_file":  common.sessionFile,
-			"auth_settings": map[string]any{"username": auth.Username, "save_username": auth.SaveUsername, "save_password": auth.SavePassword, "password_stored": auth.Password != ""},
+			"auth_settings": map[string]any{"username": auth.Username, "save_username": auth.SaveUsername, "save_password": auth.SavePassword, "password_stored": auth.Password != "", "totp_secret_stored": auth.TOTPSecret != "", "totp_base_url": auth.TOTPBaseURL},
 		})
 		return
 	}
@@ -932,6 +983,10 @@ func runAuth(args []string) {
 	fmt.Printf("  save_username: %t\n", auth.SaveUsername)
 	fmt.Printf("  save_password: %t\n", auth.SavePassword)
 	fmt.Printf("  password_stored: %t\n", auth.Password != "")
+	fmt.Printf("  totp_secret_stored: %t\n", auth.TOTPSecret != "")
+	if auth.TOTPBaseURL != "" {
+		fmt.Printf("  totp_base_url: %s\n", auth.TOTPBaseURL)
+	}
 }
 
 func ensureInteractiveSession(common commonFlags) error {
@@ -1210,7 +1265,7 @@ func runAppTUI(args []string) {
 	}
 
 	previewExec := func(ctx context.Context, asset state.AssetRef) (filepreview.Content, error) {
-		session, err := themis.LoadSessionWithAuthConfig(common.baseURL, themis.AuthConfig{SessionFile: common.sessionFile})
+		session, err := themis.NewSessionWithAuthConfig(common.baseURL, themis.AuthConfig{SessionFile: common.sessionFile, Context: ctx})
 		if err != nil {
 			return filepreview.Content{}, err
 		}
@@ -1332,6 +1387,14 @@ func printUsage() {
 	fmt.Println("  themis  Open the interactive TUI app")
 	fmt.Println()
 	fmt.Println("Subcommands:")
+	fmt.Println("  capabilities            Describe noninteractive command capabilities")
+	fmt.Println("  catalog list            Browse cached years, courses and exercises")
+	fmt.Println("  search / show           Find targets and inspect assignment materials")
+	fmt.Println("  assets list / read      Inspect files and read paginated PDF/text")
+	fmt.Println("  setup plan / apply      Prepare labs inside existing workspaces")
+	fmt.Println("  downloads plan / apply  Review and download selected assignment assets")
+	fmt.Println("  project inspect/unlink  Inspect or remove an effective directory link")
+	fmt.Println("  auth status             Check authentication without prompting")
 	fmt.Println("  check  Validate authentication and base URL access")
 	fmt.Println("  list   List available test case indices")
 	fmt.Println("  fetch  Download available test cases")
@@ -1354,7 +1417,7 @@ func printUsage() {
 	fmt.Println("  submit --assignment-url <url> --file <path>... [--folder <path>...] [--language <id>] [--dry-run] [--yes] [--watch=false] [--timeout 15m]")
 	fmt.Println("  status --submission-url <url> [--watch] [--timeout 15m]")
 	fmt.Println("  login [--username <value>] [--password <value>] [--totp <value>]")
-	fmt.Println("  auth [--username <value>] [--password <value>] [--save-username=<bool>] [--save-password=<bool>] [--clear-username] [--clear-password]")
+	fmt.Println("  auth [--totp-secret-stdin | --clear-totp-secret] [--username <value>] [--password <value>] [--save-username=<bool>] [--save-password=<bool>] [--clear-username] [--clear-password]")
 	fmt.Println("  project link --root-url <url> [--default-refresh-depth <n>]")
 	fmt.Println("  project refresh [--depth <n>]")
 	fmt.Println("  themis [--root-url <url>] [--auto-refresh-on-open=false] [--reduced-motion]")
@@ -1454,4 +1517,30 @@ func resolveOutputDir(outFlag string, targetAlias string) (string, error) {
 		return "", fmt.Errorf("failed to resolve output path %q: %w", selected, err)
 	}
 	return resolved, nil
+}
+
+// Read from a terminal without echoing, or accept a bounded secret from a pipe.
+// Keeping the key out of argv avoids shell history and process-list exposure.
+func readAuthenticatorKey(input *os.File, prompt io.Writer) (string, error) {
+	var raw []byte
+	var err error
+	if term.IsTerminal(int(input.Fd())) {
+		fmt.Fprint(prompt, "Authenticator key (hidden): ")
+		raw, err = term.ReadPassword(int(input.Fd()))
+		fmt.Fprintln(prompt)
+	} else {
+		raw, err = io.ReadAll(io.LimitReader(input, 8193))
+	}
+	if err != nil {
+		return "", fmt.Errorf("read authenticator key: %w", err)
+	}
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
+	if len(raw) > 8192 {
+		return "", fmt.Errorf("authenticator key input is too large")
+	}
+	return themis.NormalizeTOTPSecret(string(raw))
 }

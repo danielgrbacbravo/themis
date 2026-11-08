@@ -33,6 +33,7 @@ type LoginRequest struct {
 	Username     string
 	Password     string
 	TOTP         string
+	TOTPSecret   string
 	SaveUsername bool
 	SavePassword bool
 }
@@ -50,14 +51,21 @@ func PerformSSOLogin(baseURL string, authConfig AuthConfig, req LoginRequest) (L
 	if strings.TrimSpace(req.Username) == "" || strings.TrimSpace(req.Password) == "" {
 		return LoginResult{}, fmt.Errorf("%w: username and password are required", ErrMissingCredentials)
 	}
-	if strings.TrimSpace(req.TOTP) == "" {
+	if strings.TrimSpace(req.TOTP) == "" && req.TOTPSecret == "" {
 		return LoginResult{}, fmt.Errorf("%w: totp is required", ErrMissingCredentials)
 	}
 
+	if req.TOTPSecret != "" {
+		req.TOTPSecret, err = NormalizeTOTPSecret(req.TOTPSecret)
+		if err != nil {
+			return LoginResult{}, err
+		}
+	}
 	client, err := initializeHTTPClient()
 	if err != nil {
 		return LoginResult{}, err
 	}
+	bindAuthContext(client, authConfig)
 	client.Timeout = authTimeout
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -89,6 +97,10 @@ func PerformSSOLogin(baseURL string, authConfig AuthConfig, req LoginRequest) (L
 	}
 	if authSettings.SavePassword {
 		authSettings.Password = req.Password
+	}
+	if req.TOTPSecret != "" && authSettings.SaveUsername {
+		authSettings.TOTPSecret = req.TOTPSecret
+		authSettings.TOTPBaseURL = normalizedBaseURL
 	}
 	user := &SessionUser{
 		FullName:      userData.FullName,
@@ -184,7 +196,7 @@ func runSSOSequence(client *http.Client, baseURL string, req LoginRequest) error
 				}
 			}
 			authDebugf(
-				"stall markers: has_form=%t has_meta_refresh=%t has_window_location=%t has_saml_redirect=%t has_credentials=%t has_mfa=%t has_no_session=%t body_prefix=%q",
+				"stall markers: has_form=%t has_meta_refresh=%t has_window_location=%t has_saml_redirect=%t has_credentials=%t has_mfa=%t has_no_session=%t",
 				strings.Contains(strings.ToLower(bodyStr), "<form"),
 				metaRefreshURLPattern.FindStringSubmatch(bodyStr) != nil || metaRefreshURLPattern2.FindStringSubmatch(bodyStr) != nil,
 				jsRedirectURLPattern.FindStringSubmatch(bodyStr) != nil,
@@ -192,7 +204,6 @@ func runSSOSequence(client *http.Client, baseURL string, req LoginRequest) error
 				strings.Contains(bodyStr, "Ecom_User_ID") || strings.Contains(bodyStr, "Ecom_Password"),
 				strings.Contains(bodyStr, `name="nffc"`) || strings.Contains(bodyStr, "name='nffc'"),
 				strings.Contains(strings.ToLower(bodyStr), "no session"),
-				bodyPrefix(bodyStr, 240),
 			)
 			return fmt.Errorf("%w: login sequence stalled at %s (stage=%s)", ErrNotAuthenticated, currentURL, lastStage)
 		}
@@ -250,7 +261,14 @@ func nextAuthAction(doc *goquery.Document, pageURL *url.URL, req LoginRequest) (
 	}
 
 	if hasInput(form, "nffc") {
-		values.Set("nffc", strings.TrimSpace(req.TOTP))
+		code := strings.TrimSpace(req.TOTP)
+		if code == "" {
+			code, err = TOTPCode(req.TOTPSecret, time.Now())
+			if err != nil {
+				return nil, "mfa", err
+			}
+		}
+		values.Set("nffc", code)
 		values.Set("option", "credential")
 		return &authAction{
 			method:    http.MethodPost,

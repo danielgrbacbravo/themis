@@ -46,7 +46,8 @@ Notes:
 - `themis login` with no auth flags opens the login TUI.
 - `themis login` with any of `--username`, `--password`, or `--totp` performs a non-interactive login attempt.
 - If username/password are already saved in auth settings, `--totp` alone is enough for non-interactive login.
-- Non-TUI commands never open the login TUI; they return `not authenticated` or `session expired`.
+- Non-TUI commands never open the login TUI. With a saved username, password, and authenticator key, they renew an expired session automatically; otherwise they return an authentication error.
+- `themis login --non-interactive --json` uses saved credentials without opening a prompt. An explicit `--totp` overrides the saved key.
 
 ### auth
 View or update persisted auth settings stored alongside the session.
@@ -63,6 +64,28 @@ Example updates:
 ./themis auth --username "s1234567"
 ./themis auth --clear-password
 ```
+
+#### Optional automatic 2FA
+
+First log in and enable remembering your username and password in the login screen. Then save your authenticator's **setup key** (the base32 secret or `otpauth://totp/...` provisioning URI, not a six-digit code):
+
+```sh
+themis auth --totp-secret-stdin
+```
+
+In a terminal this prompts with hidden input. It also accepts piped input from a secret manager. The key is never accepted as a command-line argument or included in status output. Standard SHA1, six-digit, 30-second TOTP keys are supported; unsupported provisioning settings are rejected.
+
+After configuration, CLI and TUI operations reuse valid cookies and make one automatic login attempt when the session expires. Codes are generated locally when the 2FA challenge appears. No authenticator app or interactive prompt is needed. Agent commands retain their cancellation/deadlines, and connection/server failures do not trigger a new login. An incorrect key or out-of-sync system clock causes an authentication error rather than repeated OTP attempts. Submissions are never automatically replayed.
+
+```sh
+themis auth --json                         # reports whether a key is stored
+themis login --non-interactive --json      # verify or establish a session
+themis auth --clear-totp-secret            # disable automatic 2FA
+```
+
+The key is opt-in and bound to the saved username and Themis instance. Changing or clearing the username clears the old key; clearing the password leaves the key but disables automatic login. Manual login preserves the key for the same account. Removing the locally saved key does not revoke the authenticator at the university.
+
+Credentials and cookies are stored **unencrypted** in the same session file, written atomically with owner-only permissions (`0600`). This is file storage, not the macOS Keychain. A saved password and authenticator key together provide full account login access. Keep the file out of repositories, shared directories, logs, and agent context; configure the key locally rather than pasting it into chat.
 
 ### check
 Validate base URL access and authentication.
@@ -203,11 +226,14 @@ Common flags on all subcommands:
 - `--target-dir` (deprecated alias for `--out`)
 
 `login` flags:
+- `--non-interactive`
 - `--username`
 - `--password`
 - `--totp`
 
 `auth` flags:
+- `--totp-secret-stdin`
+- `--clear-totp-secret`
 - `--username`
 - `--password`
 - `--save-username`
@@ -233,6 +259,23 @@ Auth/session persistence:
 1. Session cookies, saved credentials, and auth preferences live in one session file.
 2. Default session file path is `$HOME/.config/themis/session.json`.
 3. Commands other than bare `themis` do not auto-launch interactive login.
+
+## Agent-facing workflows
+
+The CLI can inspect an existing project, search assignments, read PDFs/text, and prepare lab materials without driving the TUI. Start with `themis capabilities --json`.
+
+```sh
+themis project inspect --dir /path/to/pc-assignments --json
+themis search 'lab 7' --dir /path/to/pc-assignments --refresh --json
+themis show --target 'LAB_URL_FROM_SEARCH' --refresh --depth 1 --json
+themis setup plan --dir /path/to/pc-assignments --target 'LAB_URL_FROM_SEARCH' \
+  --into pc-lab-07 --out /tmp/lab7-plan.json --json
+themis setup apply --dir /path/to/pc-assignments --plan /tmp/lab7-plan.json --json
+```
+
+Setup targets existing workspaces. Agents can inspect earlier lab directories, read the actual assignment materials, and pass explicit exercise-folder mappings. Planning reports conflicts; applying preserves modified files by default and supports resuming partial downloads. Search reports partial catalog coverage and keeps unknown submission states distinct.
+
+See [Agent CLI](docs/agent-cli.md) for all commands, mapping files, document pagination, JSON/error contracts, and freshness controls. These commands use a new versioned JSON envelope; the legacy command formats below remain unchanged.
 
 ## JSON Output
 

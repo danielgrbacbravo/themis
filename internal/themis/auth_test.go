@@ -63,9 +63,10 @@ func TestNextAuthAction_MFAForm(t *testing.T) {
 	pageURL, _ := url.Parse("https://xfactor.rug.nl/challenge")
 
 	next, stage, err := nextAuthAction(doc, pageURL, LoginRequest{
-		Username: "alice",
-		Password: "secret",
-		TOTP:     "654321",
+		Username:   "alice",
+		Password:   "secret",
+		TOTP:       "654321",
+		TOTPSecret: testTOTPSecret,
 	})
 	if err != nil {
 		t.Fatalf("next action error: %v", err)

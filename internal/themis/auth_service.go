@@ -47,6 +47,14 @@ func (s *AuthService) VerifySession() (*Session, UserData, error) {
 }
 
 func (s *AuthService) Login(req LoginRequest) (LoginResult, error) {
+	auth, err := LoadAuthSettings(s.Config.SessionFile)
+	if err != nil {
+		return LoginResult{}, err
+	}
+	// Preserve a configured key across manual logins for the same account only.
+	if req.TOTPSecret == "" {
+		req.TOTPSecret = savedTOTPFor(auth, req.Username, s.BaseURL)
+	}
 	result, err := PerformSSOLogin(s.BaseURL, s.Config, req)
 	if err != nil {
 		return LoginResult{}, err
@@ -56,7 +64,7 @@ func (s *AuthService) Login(req LoginRequest) (LoginResult, error) {
 
 func (s *AuthService) ResolveLoginRequest(username string, password string, totp string) (LoginRequest, error) {
 	mergedUsername := strings.TrimSpace(username)
-	mergedPassword := strings.TrimSpace(password)
+	mergedPassword := password
 	mergedTOTP := strings.TrimSpace(totp)
 
 	auth, err := LoadAuthSettings(s.Config.SessionFile)
@@ -64,11 +72,14 @@ func (s *AuthService) ResolveLoginRequest(username string, password string, totp
 		return LoginRequest{}, err
 	}
 
+	if (username == "" || strings.TrimSpace(username) == auth.Username) && auth.TOTPSecret != "" && auth.TOTPBaseURL != s.BaseURL {
+		return LoginRequest{}, fmt.Errorf("saved authenticator key belongs to another Themis instance")
+	}
 	if mergedUsername == "" && auth.SaveUsername {
 		mergedUsername = strings.TrimSpace(auth.Username)
 	}
-	if mergedPassword == "" && auth.SavePassword {
-		mergedPassword = strings.TrimSpace(auth.Password)
+	if mergedPassword == "" && auth.SavePassword && mergedUsername == auth.Username {
+		mergedPassword = auth.Password
 	}
 
 	if mergedUsername == "" {
@@ -77,7 +88,7 @@ func (s *AuthService) ResolveLoginRequest(username string, password string, totp
 	if mergedPassword == "" {
 		return LoginRequest{}, fmt.Errorf("%w: password is required for non-interactive login", ErrMissingCredentials)
 	}
-	if mergedTOTP == "" {
+	if mergedTOTP == "" && (auth.TOTPSecret == "" || mergedUsername != auth.Username) {
 		return LoginRequest{}, fmt.Errorf("%w: --totp is required for non-interactive login", ErrMissingCredentials)
 	}
 
@@ -85,7 +96,15 @@ func (s *AuthService) ResolveLoginRequest(username string, password string, totp
 		Username:     mergedUsername,
 		Password:     mergedPassword,
 		TOTP:         mergedTOTP,
+		TOTPSecret:   savedTOTPFor(auth, mergedUsername, s.BaseURL),
 		SaveUsername: auth.SaveUsername,
 		SavePassword: auth.SavePassword,
 	}, nil
+}
+
+func savedTOTPFor(auth SessionAuthSettings, username, baseURL string) string {
+	if auth.Username == strings.TrimSpace(username) && auth.TOTPBaseURL == baseURL {
+		return auth.TOTPSecret
+	}
+	return ""
 }

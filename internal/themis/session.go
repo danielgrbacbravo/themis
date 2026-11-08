@@ -1,6 +1,7 @@
 package themis
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ type Session struct {
 
 type AuthConfig struct {
 	SessionFile string
+	Context     context.Context
 }
 
 type UserData struct {
@@ -49,16 +51,42 @@ func NewSession(baseURL string, cookiePath string) (*Session, error) {
 
 func NewSessionWithAuthConfig(baseURL string, authConfig AuthConfig) (*Session, error) {
 	session, err := LoadSessionWithAuthConfig(baseURL, authConfig)
+	if err == nil {
+		_, err = session.ValidateAuthentication()
+	}
+	if err == nil {
+		return session, nil
+	}
+	// Only an authentication failure permits renewal. Network/server errors must
+	// remain errors, rather than triggering another credential submission.
+	if !errors.Is(err, ErrSessionExpired) && !errors.Is(err, ErrNotAuthenticated) {
+		return nil, err
+	}
+	service, serviceErr := NewAuthService(baseURL, authConfig)
+	if serviceErr != nil {
+		return nil, serviceErr
+	}
+	auth, loadErr := LoadAuthSettings(authConfig.SessionFile)
+	if loadErr != nil {
+		return nil, loadErr
+	}
+	if auth.TOTPSecret == "" || !auth.SavePassword || !auth.SaveUsername || auth.Password == "" || auth.Username == "" {
+		return nil, err
+	}
+	request, resolveErr := service.ResolveLoginRequest("", "", "")
+	if resolveErr != nil {
+		return nil, resolveErr
+	}
+	if _, loginErr := service.Login(request); loginErr != nil {
+		return nil, loginErr
+	}
+	session, err = LoadSessionWithAuthConfig(baseURL, authConfig)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := session.ValidateAuthentication(); err != nil {
-		if errors.Is(err, ErrSessionExpired) || errors.Is(err, ErrNotAuthenticated) {
-			return nil, err
-		}
-		return nil, fmt.Errorf("%w: %v", ErrSessionExpired, err)
+		return nil, err
 	}
-
 	return session, nil
 }
 
@@ -74,6 +102,8 @@ func LoadSessionWithAuthConfig(baseURL string, authConfig AuthConfig) (*Session,
 	if err != nil {
 		return nil, err
 	}
+
+	bindAuthContext(client, authConfig)
 
 	parsedBaseURL, err := url.Parse(normalizedBaseURL)
 	if err != nil {
@@ -357,8 +387,21 @@ func SaveSessionState(path string, state SessionState) error {
 		return fmt.Errorf("encode session state: %w", err)
 	}
 	payload = append(payload, '\n')
-	if err := os.WriteFile(path, payload, 0o600); err != nil {
-		return fmt.Errorf("write session file %q: %w", path, err)
+	// A private temporary file also replaces older, overly permissive files.
+	temp, err := os.CreateTemp(dir, ".themis-session-*")
+	if err != nil {
+		return fmt.Errorf("create private session file: %w", err)
+	}
+	defer os.Remove(temp.Name())
+	if _, err := temp.Write(payload); err != nil {
+		temp.Close()
+		return fmt.Errorf("write session file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close session file: %w", err)
+	}
+	if err := os.Rename(temp.Name(), path); err != nil {
+		return fmt.Errorf("save session file: %w", err)
 	}
 	return nil
 }
@@ -436,6 +479,8 @@ type SessionUser struct {
 }
 
 type SessionAuthSettings struct {
+	TOTPSecret   string `json:"totp_secret,omitempty"`
+	TOTPBaseURL  string `json:"totp_base_url,omitempty"`
 	Username     string `json:"username,omitempty"`
 	Password     string `json:"password,omitempty"`
 	SaveUsername bool   `json:"save_username"`
@@ -546,4 +591,24 @@ func classifyLoadSessionError(err error) error {
 		return fmt.Errorf("%w: %v", ErrNotAuthenticated, err)
 	}
 	return err
+}
+
+// All requests, including SSO redirects and renewal, share the caller's deadline.
+type authContextTransport struct {
+	ctx       context.Context
+	transport http.RoundTripper
+}
+
+func (t authContextTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return t.transport.RoundTrip(r.Clone(t.ctx))
+}
+func bindAuthContext(client *http.Client, config AuthConfig) {
+	if config.Context == nil {
+		return
+	}
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	client.Transport = authContextTransport{config.Context, transport}
 }

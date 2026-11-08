@@ -2,6 +2,7 @@ package themis
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -51,6 +52,25 @@ func SaveAuthSettings(sessionFile string, auth SessionAuthSettings) error {
 		state.Cookies = []SessionCookieScope{}
 	}
 
+	if state.Auth.Username != auth.Username && state.Auth.TOTPSecret == auth.TOTPSecret {
+		auth.TOTPSecret, auth.TOTPBaseURL = "", ""
+	}
+	if auth.TOTPSecret != "" {
+		if !auth.SaveUsername || strings.TrimSpace(auth.Username) == "" {
+			return fmt.Errorf("save a username before storing a TOTP key")
+		}
+		auth.TOTPSecret, err = NormalizeTOTPSecret(auth.TOTPSecret)
+		if err != nil {
+			return err
+		}
+		if auth.TOTPBaseURL == "" {
+			return fmt.Errorf("TOTP key must be bound to a Themis instance")
+		}
+		auth.TOTPBaseURL, err = NormalizeBaseURL(auth.TOTPBaseURL)
+		if err != nil {
+			return fmt.Errorf("invalid TOTP instance URL")
+		}
+	}
 	state.Auth = normalizeAuthSettings(auth)
 	return SaveSessionState(path, state)
 }
@@ -67,6 +87,12 @@ func normalizeAuthSettings(auth SessionAuthSettings) SessionAuthSettings {
 	}
 	if !auth.SavePassword {
 		auth.Password = ""
+	}
+	if !auth.SaveUsername || auth.Username == "" {
+		auth.TOTPSecret = ""
+	}
+	if auth.TOTPSecret == "" {
+		auth.TOTPBaseURL = ""
 	}
 	return auth
 }
