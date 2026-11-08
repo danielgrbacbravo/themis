@@ -22,3 +22,11 @@
 
 # Go workspace file
 go.work
+
+# Local release artifacts and credentials
+/themis
+/dist/
+.DS_Store
+/.themis/
+/session.json
+/cookies.json

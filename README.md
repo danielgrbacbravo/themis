@@ -1,6 +1,32 @@
 # Themis-CLI
 a CLI/TUI Client for the RUG judging software (aka Themis)
 
+## Install
+
+On macOS or Linux with Homebrew:
+
+```sh
+brew install danielgrbacbravo/themis/themis
+themis --version
+themis login
+themis
+```
+
+The formula builds from source and includes Poppler for reading assignment PDFs.
+Update with `brew update && brew upgrade themis`.
+
+Prebuilt archives for macOS and Linux (Apple Silicon/ARM64 and Intel/x86-64),
+checksums, and source are available on the [Releases page](https://github.com/danielgrbacbravo/themis/releases).
+Extract the matching archive and place `themis` in a directory on your PATH.
+For manual installs, PDF reading additionally needs `brew install poppler` on
+macOS or `sudo apt install poppler-utils` on Debian/Ubuntu. The CLI/TUI otherwise
+runs as a single executable. macOS release downloads are ad-hoc signed, not
+Developer ID signed or notarized; Homebrew builds locally from source.
+
+Authentication is configured separately on each machine. Installation and
+upgrades do not distribute credentials or change your linked projects.
+See [Release maintenance](docs/releases.md) for publishing and tap updates.
+
 ## Build
 
 ```sh

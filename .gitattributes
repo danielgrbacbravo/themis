@@ -1,0 +1,9 @@
+# Exclude local build output, captured pages, and unrelated research from source releases.
+/themis export-ignore
+/.DS_Store export-ignore
+/scripts/.DS_Store export-ignore
+/err.log export-ignore
+/courses.html* export-ignore
+/example-assignment.html export-ignore
+/stats.html export-ignore
+/docs/brightspace-* export-ignore

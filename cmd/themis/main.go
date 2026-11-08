@@ -53,12 +53,18 @@ type commandResult struct {
 
 func main() {
 	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "--version" {
+		runVersion(args[1:])
+		return
+	}
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		runAppTUI(args)
 		return
 	}
 
 	switch args[0] {
+	case "version":
+		runVersion(args[1:])
 	case "capabilities", "catalog", "search", "show", "assets", "setup", "downloads":
 		os.Exit(runAgentCLI(args[0], args[1:]))
 	case "submit":
@@ -1403,6 +1409,7 @@ func printUsage() {
 	fmt.Println("  login  Authenticate interactively or non-interactively")
 	fmt.Println("  auth   View or update global auth settings")
 	fmt.Println("  project Manage directory link metadata")
+	fmt.Println("  version Show build version (also --version)")
 	fmt.Println("  tui    Alias for `themis` (deprecated)")
 	fmt.Println()
 	fmt.Println("Common flags (all subcommands):")
